@@ -109,6 +109,7 @@ from vllm_ascend.utils import (AscendDeviceType, ProfileExecuteDuration,
                                set_weight_prefetch_method, vllm_version_is)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.npu_ubatch_wrapper import AscendUBatchWrapper
+from vllm_ascend.worker.npu_dualstream_batch_wrapper import DualStreamUBatchWrapper
 from vllm_ascend.worker.pcp_utils import PCPManager
 from vllm_ascend.worker.ubatch_utils import (check_enable_ubatch,
                                              maybe_create_ubatch_slices)
@@ -492,7 +493,7 @@ class NPUModelRunner(GPUModelRunner):
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.
-        if isinstance(self.model, (ACLGraphWrapper, AscendUBatchWrapper)):
+        if isinstance(self.model, (ACLGraphWrapper, AscendUBatchWrapper, DualStreamUBatchWrapper)):
             return self.model.unwrap()
         return self.model
 
@@ -2504,6 +2505,9 @@ class NPUModelRunner(GPUModelRunner):
                     m.consumed_memory / float(2**30))
 
         # wrap the model with full graph wrapper if needed.
+        # Check if dual stream wrapper should be used
+        use_dual_stream = self.parallel_config.enable_dual_stream_wrapper
+        
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             # TODO(zxdu): should update to use_ubatching in v0.14.0
@@ -2512,12 +2516,21 @@ class NPUModelRunner(GPUModelRunner):
                                              self.vllm_config,
                                              runtime_mode=CUDAGraphMode.FULL)
             else:
-                self.model = AscendUBatchWrapper(self.model, self.vllm_config,
-                                                 CUDAGraphMode.FULL,
-                                                 self.device)
+                if use_dual_stream:
+                    self.model = DualStreamUBatchWrapper(self.model, self.vllm_config,
+                                                        CUDAGraphMode.FULL,
+                                                        self.device)
+                else:
+                    self.model = AscendUBatchWrapper(self.model, self.vllm_config,
+                                                     CUDAGraphMode.FULL,
+                                                     self.device)
         elif self.parallel_config.enable_dbo:
-            self.model = AscendUBatchWrapper(self.model, self.vllm_config,
-                                             CUDAGraphMode.NONE, self.device)
+            if use_dual_stream:
+                self.model = DualStreamUBatchWrapper(self.model, self.vllm_config,
+                                                     CUDAGraphMode.NONE, self.device)
+            else:
+                self.model = AscendUBatchWrapper(self.model, self.vllm_config,
+                                                 CUDAGraphMode.NONE, self.device)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
