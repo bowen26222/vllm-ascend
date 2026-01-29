@@ -97,6 +97,25 @@ def check_enable_ubatch(num_scheduled_tokens_per_request: np.ndarray,
         uniform_decode=uniform_decode,
     )
 
+    # Enable ubatching if dual stream wrapper is enabled, even without dbo
+    enable_dual_stream_wrapper = getattr(parallel_config, 'enable_dual_stream_wrapper', False)
+    if enable_dual_stream_wrapper:
+        # For dual stream wrapper, we need ubatch_slices even if dbo is disabled
+        # But still need to check other conditions
+        if moe_comm_type == MoECommType.MC2:
+            return False
+        
+        # Still need to check if last ubatch would be empty
+        if hasattr(vllm_config.parallel_config, 'num_ubatches'):
+            num_ubatches = vllm_config.parallel_config.num_ubatches
+        else:
+            num_ubatches = 2
+        if is_last_ubatch_empty(num_tokens_unpadded, num_tokens_padded, num_ubatches):
+            return False
+        
+        # Skip threshold check for dual stream wrapper to ensure ubatch_slices are created
+        return True
+
     if not parallel_config.enable_dbo or not should_attempt_ubatching or moe_comm_type == MoECommType.MC2:
         return False
 

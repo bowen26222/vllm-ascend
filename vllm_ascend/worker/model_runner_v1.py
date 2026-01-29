@@ -2506,31 +2506,34 @@ class NPUModelRunner(GPUModelRunner):
 
         # wrap the model with full graph wrapper if needed.
         # Check if dual stream wrapper should be used
-        use_dual_stream = self.parallel_config.enable_dual_stream_wrapper
+        self.use_dual_stream = self.parallel_config.enable_dual_stream_wrapper
+        has_full = self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         
-        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+        if has_full:
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             # TODO(zxdu): should update to use_ubatching in v0.14.0
-            if not self.parallel_config.enable_dbo:
+            if self.use_dual_stream:
+                # Use DualStreamUBatchWrapper regardless of enable_dbo
+                logger.info("Using DualStreamUBatchWrapper (FULL cudagraph mode)")
+                self.model = DualStreamUBatchWrapper(self.model, self.vllm_config,
+                                                    CUDAGraphMode.FULL,
+                                                    self.device)
+            elif self.parallel_config.enable_dbo:
+                self.model = AscendUBatchWrapper(self.model, self.vllm_config,
+                                                 CUDAGraphMode.FULL,
+                                                 self.device)
+            else:
                 self.model = ACLGraphWrapper(self.model,
                                              self.vllm_config,
                                              runtime_mode=CUDAGraphMode.FULL)
-            else:
-                if use_dual_stream:
-                    self.model = DualStreamUBatchWrapper(self.model, self.vllm_config,
-                                                        CUDAGraphMode.FULL,
-                                                        self.device)
-                else:
-                    self.model = AscendUBatchWrapper(self.model, self.vllm_config,
-                                                     CUDAGraphMode.FULL,
-                                                     self.device)
-        elif self.parallel_config.enable_dbo:
-            if use_dual_stream:
-                self.model = DualStreamUBatchWrapper(self.model, self.vllm_config,
-                                                     CUDAGraphMode.NONE, self.device)
-            else:
-                self.model = AscendUBatchWrapper(self.model, self.vllm_config,
+        elif self.use_dual_stream:
+            # Use DualStreamUBatchWrapper even without full cudagraphs
+            logger.info("Using DualStreamUBatchWrapper (PIECEWISE cudagraph mode)")
+            self.model = DualStreamUBatchWrapper(self.model, self.vllm_config,
                                                  CUDAGraphMode.NONE, self.device)
+        elif self.parallel_config.enable_dbo:
+            self.model = AscendUBatchWrapper(self.model, self.vllm_config,
+                                             CUDAGraphMode.NONE, self.device)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -2999,14 +3002,23 @@ class NPUModelRunner(GPUModelRunner):
             for (attn_backend,
                  kv_cache_spec), layer_names in attn_backends_map.items():
                 # TODO(zxdu): should update to use_ubatching in 0.14.0
+                # Determine number of metadata builders needed
+                # If enable_dbo, need 2 builders
+                # If enable_dual_stream_wrapper, also need 2 builders (default num_ubatches=2)
+                # Otherwise, need 1 builder
+                enable_dual_stream = getattr(self.parallel_config, 'enable_dual_stream_wrapper', False)
+                if self.parallel_config.enable_dbo or enable_dual_stream:
+                    num_builders = 2
+                else:
+                    num_builders = 1
+                
                 attn_metadata_builders = [
                     attn_backend.get_builder_cls()(
                         kv_cache_spec,
                         layer_names,
                         self.vllm_config,
                         self.device,
-                    ) for _ in range(
-                        1 if not self.parallel_config.enable_dbo else 2)
+                    ) for _ in range(num_builders)
                 ]
 
                 attn_group = AttentionGroup(attn_backend, layer_names,
