@@ -18,6 +18,7 @@
 import torch
 from einops import rearrange
 from torch import nn
+from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops import (
@@ -35,14 +36,6 @@ from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import \
 from vllm_ascend.ops.triton.fla.sigmoid_gating import \
     fused_sigmoid_gating_delta_rule_update
 from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
-from vllm_ascend.utils import vllm_version_is
-
-# isort: off
-if vllm_version_is('0.13.0'):
-    from vllm.attention.backends.abstract import AttentionMetadata  # type: ignore
-else:
-    from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
-# isort: on
 
 
 class AscendQwen3Next_GatedDeltaNet(nn.Module, MambaBase):

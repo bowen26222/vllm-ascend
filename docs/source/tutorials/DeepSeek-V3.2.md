@@ -19,7 +19,7 @@ Refer to [feature guide](../user_guide/feature_guide/index.md) to get the featur
 - `DeepSeek-V3.2-Exp`(BF16 version): require 2 Atlas 800 A3 (64G × 16) nodes or 4 Atlas 800 A2 (64G × 8) nodes. [Download model weight](https://modelers.cn/models/Modelers_Park/DeepSeek-V3.2-Exp-BF16)
 - `DeepSeek-V3.2-Exp-w8a8`(Quantized version): require 1 Atlas 800 A3 (64G × 16) node or 2 Atlas 800 A2 (64G × 8) nodes. [Download model weight](https://modelers.cn/models/Modelers_Park/DeepSeek-V3.2-Exp-w8a8)
 - `DeepSeek-V3.2`(BF16 version): require 2 Atlas 800 A3 (64G × 16) nodes or 4 Atlas 800 A2 (64G × 8) nodes. Model weight in BF16 not found now.
-- `DeepSeek-V3.2-w8a8`(Quantized version): require 1 Atlas 800 A3 (64G × 16) node or 2 Atlas 800 A2 (64G × 8) nodes. [Download model weight](https://www.modelscope.cn/models/vllm-ascend/DeepSeek-V3.2-W8A8/)
+- `DeepSeek-V3.2-w8a8`(Quantized version): require 1 Atlas 800 A3 (64G × 16) node or 2 Atlas 800 A2 (64G × 8) nodes. [Download model weight](https://modelers.cn/models/Eco-Tech/DeepSeek-V3.2-w8a8-QuaRot)
 
 It is recommended to download the model weight to the shared directory of multiple nodes, such as `/root/.cache/`
 
@@ -36,19 +36,17 @@ We strongly recommend you to install triton ascend package to speed up the infer
 
 The [Triton Ascend](https://gitee.com/ascend/triton-ascend) is for better performance, please follow the instructions below to install it and its dependency.
 
-Install the Ascend BiSheng toolkit, execute the command:
+Source the Ascend BiSheng toolkit, execute the command:
 
 ```bash
-BISHENG_NAME="Ascend-BiSheng-toolkit_$(uname -i)_20260105.run"
-BISHENG_URL="https://vllm-ascend.obs.cn-north-4.myhuaweicloud.com/vllm-ascend/${BISHENG_NAME}"
-wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
-export PATH=/usr/local/Ascend/tools/bishengir/bin:$PATH
+source /usr/local/Ascend/ascend-toolkit/8.3.RC2/bisheng_toolkit/set_env.sh
 ```
 
 Install Triton Ascend:
 
 ```bash
-python3 -m pip install -i https://test.pypi.org/simple/ triton-ascend==3.2.0.dev20260105
+wget https://vllm-ascend.obs.cn-north-4.myhuaweicloud.com/vllm-ascend/triton_ascend-3.2.0.dev2025110717-cp311-cp311-manylinux_2_27_aarch64.whl
+pip install triton_ascend-3.2.0.dev2025110717-cp311-cp311-manylinux_2_27_aarch64.whl
 ```
 
 :::
@@ -153,10 +151,9 @@ In this tutorial, we suppose you downloaded the model weight to `/root/.cache/`.
 We'd like to show the deployment guide of `DeepSeek-V3.2` on multi-node environment with 1P1D for better performance.
 
 Before you start, please
-
 1. prepare the script `launch_online_dp.py` on each node.
 
-    ```python
+    ```
     import argparse
     import multiprocessing
     import os
@@ -261,7 +258,7 @@ Before you start, please
 
     1. Prefill node 0
 
-        ```shell
+        ```
         nic_name="enp48s3u1u1" # change to your own nic name
         local_ip=141.61.39.105 # change to your own ip
 
@@ -278,6 +275,9 @@ Before you start, please
         export VLLM_USE_V1=1
         export HCCL_BUFFSIZE=256
 
+        export VLLM_TORCH_PROFILER_DIR="./vllm_profile"
+        export VLLM_TORCH_PROFILER_WITH_STACK=0
+
         export ASCEND_AGGREGATE_ENABLE=1
         export ASCEND_TRANSPORT_PRINT=1
         export ACL_OP_INIT_MODE=1
@@ -289,7 +289,7 @@ Before you start, please
         export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
 
 
-        vllm serve /root/.cache/Eco-Tech/DeepSeek-V3.2-w8a8-mtp-QuaRot \
+        vllm serve /root/.cache/Eco-Tech/DeepSeek-V3.2-w8a8-QuaRot \
             --host 0.0.0.0 \
             --port $2 \
             --data-parallel-size $3 \
@@ -299,10 +299,6 @@ Before you start, please
             --tensor-parallel-size $7 \
             --enable-expert-parallel \
             --speculative-config '{"num_speculative_tokens": 2, "method":"deepseek_mtp"}' \
-            --profiler-config \
-            '{"profiler": "torch",
-            "torch_profiler_dir": "./vllm_profile",
-            "torch_profiler_with_stack": false}' \
             --seed 1024 \
             --served-model-name dsv3 \
             --max-model-len 68000 \
@@ -318,6 +314,7 @@ Before you start, please
             "kv_role": "kv_producer",
             "kv_port": "30000",
             "engine_id": "0",
+            "kv_connector_module_path": "vllm_ascend.distributed.mooncake_connector",
             "kv_connector_extra_config": {
                         "use_ascend_direct": true,
                         "prefill": {
@@ -335,7 +332,7 @@ Before you start, please
 
     2. Prefill node 1
 
-        ```shell
+        ```
         nic_name="enp48s3u1u1" # change to your own nic name
         local_ip=141.61.39.113 # change to your own ip
 
@@ -352,6 +349,9 @@ Before you start, please
         export VLLM_USE_V1=1
         export HCCL_BUFFSIZE=256
 
+        export VLLM_TORCH_PROFILER_DIR="./vllm_profile"
+        export VLLM_TORCH_PROFILER_WITH_STACK=0
+
         export ASCEND_AGGREGATE_ENABLE=1
         export ASCEND_TRANSPORT_PRINT=1
         export ACL_OP_INIT_MODE=1
@@ -364,7 +364,7 @@ Before you start, please
         export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
 
 
-        vllm serve /root/.cache/Eco-Tech/DeepSeek-V3.2-w8a8-mtp-QuaRot \
+        vllm serve /root/.cache/Eco-Tech/DeepSeek-V3.2-w8a8-QuaRot \
             --host 0.0.0.0 \
             --port $2 \
             --data-parallel-size $3 \
@@ -374,10 +374,6 @@ Before you start, please
             --tensor-parallel-size $7 \
             --enable-expert-parallel \
             --speculative-config '{"num_speculative_tokens": 2, "method":"deepseek_mtp"}' \
-            --profiler-config \
-            '{"profiler": "torch",
-            "torch_profiler_dir": "./vllm_profile",
-            "torch_profiler_with_stack": false}' \
             --seed 1024 \
             --served-model-name dsv3 \
             --max-model-len 68000 \
@@ -393,6 +389,7 @@ Before you start, please
             "kv_role": "kv_producer",
             "kv_port": "30000",
             "engine_id": "0",
+            "kv_connector_module_path": "vllm_ascend.distributed.mooncake_connector",
             "kv_connector_extra_config": {
                         "use_ascend_direct": true,
                         "prefill": {
@@ -409,7 +406,7 @@ Before you start, please
 
     3. Decode node 0
 
-        ```shell
+        ```
         nic_name="enp48s3u1u1" # change to your own nic name
         local_ip=141.61.39.117 # change to your own ip
 
@@ -428,6 +425,8 @@ Before you start, please
         export VLLM_USE_V1=1
         export HCCL_BUFFSIZE=256
 
+        export VLLM_TORCH_PROFILER_DIR="./vllm_profile"
+        export VLLM_TORCH_PROFILER_WITH_STACK=0
 
         export ASCEND_AGGREGATE_ENABLE=1
         export ASCEND_TRANSPORT_PRINT=1
@@ -442,7 +441,7 @@ Before you start, please
         export VLLM_ASCEND_ENABLE_MLAPO=1
 
 
-        vllm serve /root/.cache/Eco-Tech/DeepSeek-V3.2-w8a8-mtp-QuaRot \
+        vllm serve /root/.cache/Eco-Tech/DeepSeek-V3.2-w8a8-QuaRot \
             --host 0.0.0.0 \
             --port $2 \
             --data-parallel-size $3 \
@@ -452,17 +451,13 @@ Before you start, please
             --tensor-parallel-size $7 \
             --enable-expert-parallel \
             --speculative-config '{"num_speculative_tokens": 2, "method":"deepseek_mtp"}' \
-            --profiler-config \
-            '{"profiler": "torch",
-            "torch_profiler_dir": "./vllm_profile",
-            "torch_profiler_with_stack": false}' \
             --seed 1024 \
             --served-model-name dsv3 \
             --max-model-len 68000 \
-            --max-num-batched-tokens 12 \
-            --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY", "cudagraph_capture_sizes":[3, 6, 9, 12]}' \
+            --max-num-batched-tokens 4 \
+            --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY", "cudagraph_capture_sizes":[2, 4, 6, 8]}' \
             --trust-remote-code \
-            --max-num-seqs 4 \
+            --max-num-seqs 1 \
             --gpu-memory-utilization 0.95 \
             --no-enable-prefix-caching \
             --async-scheduling \
@@ -472,6 +467,7 @@ Before you start, please
             "kv_role": "kv_consumer",
             "kv_port": "30100",
             "engine_id": "1",
+            "kv_connector_module_path": "vllm_ascend.distributed.mooncake_connector",
             "kv_connector_extra_config": {
                         "use_ascend_direct": true,
                         "prefill": {
@@ -483,13 +479,12 @@ Before you start, please
                                 "tp_size": 4
                         }
                 }
-            }' \
-            --additional-config '{"recompute_scheduler_enable" : true}'
+            }'
         ```
 
     4. Decode node 1
 
-        ```shell
+        ```
         nic_name="enp48s3u1u1" # change to your own nic name
         local_ip=141.61.39.181 # change to your own ip
 
@@ -508,6 +503,9 @@ Before you start, please
         export VLLM_USE_V1=1
         export HCCL_BUFFSIZE=256
 
+        export VLLM_TORCH_PROFILER_DIR="./vllm_profile"
+        export VLLM_TORCH_PROFILER_WITH_STACK=0
+
         export ASCEND_AGGREGATE_ENABLE=1
         export ASCEND_TRANSPORT_PRINT=1
         export ACL_OP_INIT_MODE=1
@@ -521,7 +519,7 @@ Before you start, please
         export VLLM_ASCEND_ENABLE_MLAPO=1
 
 
-        vllm serve /root/.cache/Eco-Tech/DeepSeek-V3.2-w8a8-mtp-QuaRot \
+        vllm serve /root/.cache/Eco-Tech/DeepSeek-V3.2-w8a8-QuaRot \
             --host 0.0.0.0 \
             --port $2 \
             --data-parallel-size $3 \
@@ -531,18 +529,14 @@ Before you start, please
             --tensor-parallel-size $7 \
             --enable-expert-parallel \
             --speculative-config '{"num_speculative_tokens": 2, "method":"deepseek_mtp"}' \
-            --profiler-config \
-            '{"profiler": "torch",
-            "torch_profiler_dir": "./vllm_profile",
-            "torch_profiler_with_stack": false}' \
             --seed 1024 \
             --served-model-name dsv3 \
             --max-model-len 68000 \
-            --max-num-batched-tokens 12 \
-            --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY",  "cudagraph_capture_sizes":[3, 6, 9, 12]}' \
+            --max-num-batched-tokens 4 \
+            --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY",  "cudagraph_capture_sizes":[2, 4, 6, 8]}' \
             --trust-remote-code \
             --async-scheduling \
-            --max-num-seqs 4 \
+            --max-num-seqs 1 \
             --gpu-memory-utilization 0.95 \
             --no-enable-prefix-caching \
             --quantization ascend \
@@ -551,6 +545,7 @@ Before you start, please
             "kv_role": "kv_consumer",
             "kv_port": "30100",
             "engine_id": "1",
+            "kv_connector_module_path": "vllm_ascend.distributed.mooncake_connector",
             "kv_connector_extra_config": {
                         "use_ascend_direct": true,
                         "prefill": {
@@ -562,36 +557,35 @@ Before you start, please
                                 "tp_size": 4
                         }
                 }
-            }' \
-            --additional-config '{"recompute_scheduler_enable" : true}'
+            }'
         ```
 
 Once the preparation is done, you can start the server with the following command on each node:
 
 1. Prefill node 0
 
-```shell
+```
 # change ip to your own
 python launch_online_dp.py --dp-size 2 --tp-size 16 --dp-size-local 1 --dp-rank-start 0 --dp-address 141.61.39.105 --dp-rpc-port 12890 --vllm-start-port 9100
 ```
 
 2. Prefill node 1
 
-```shell
+```
 # change ip to your own
 python launch_online_dp.py --dp-size 2 --tp-size 16 --dp-size-local 1 --dp-rank-start 1 --dp-address 141.61.39.105 --dp-rpc-port 12890 --vllm-start-port 9100
 ```
 
 3. Decode node 0
 
-```shell
+```
 # change ip to your own
 python launch_online_dp.py --dp-size 8 --tp-size 4 --dp-size-local 4 --dp-rank-start 0 --dp-address 141.61.39.117 --dp-rpc-port 12777 --vllm-start-port 9100
 ```
 
 4. Decode node 1
 
-```shell
+```
 # change ip to your own
 python launch_online_dp.py --dp-size 8 --tp-size 4 --dp-size-local 4 --dp-rank-start 4 --dp-address 141.61.39.117 --dp-rpc-port 12777 --vllm-start-port 9100
 ```
@@ -632,7 +626,7 @@ As an example, take the `gsm8k` dataset as a test dataset, and run accuracy eval
 ```shell
 lm_eval \
   --model local-completions \
-  --model_args model=/root/.cache/Eco-Tech/DeepSeek-V3.2-w8a8-mtp-QuaRot,base_url=http://127.0.0.1:8000/v1/completions,tokenized_requests=False,trust_remote_code=True \
+  --model_args model=/root/.cache/Eco-Tech/DeepSeek-V3.2-w8a8-QuaRot,base_url=http://127.0.0.1:8000/v1/completions,tokenized_requests=False,trust_remote_code=True \
   --tasks gsm8k \
   --output_path ./
 ```
@@ -645,16 +639,6 @@ lm_eval \
 
 Refer to [Using AISBench for performance evaluation](../developer_guide/evaluation/using_ais_bench.md#execute-performance-evaluation) for details.
 
-The performance result is:  
-
-**Hardware**: A3-752T, 4 node
-
-**Deployment**: 1P1D, Prefill node: DP2+TP16, Decode Node: DP8+TP4
-
-**Input/Output**: 64k/3k
-
-**Performance**: 533tps, TPOT 32ms
-
 ### Using vLLM Benchmark
 
 Run performance evaluation of `DeepSeek-V3.2-W8A8` as an example.
@@ -662,7 +646,6 @@ Run performance evaluation of `DeepSeek-V3.2-W8A8` as an example.
 Refer to [vllm benchmark](https://docs.vllm.ai/en/latest/contributing/benchmarks.html) for more details.
 
 There are three `vllm bench` subcommand:
-
 - `latency`: Benchmark the latency of a single batch of requests.
 - `serve`: Benchmark the online serving throughput.
 - `throughput`: Benchmark offline inference throughput.
@@ -671,11 +654,15 @@ Take the `serve` as an example. Run the code as follows.
 
 ```shell
 export VLLM_USE_MODELSCOPE=true
-vllm bench serve --model /root/.cache/Eco-Tech/DeepSeek-V3.2-w8a8-mtp-QuaRot  --dataset-name random --random-input 200 --num-prompt 200 --request-rate 1 --save-result --result-dir ./
+vllm bench serve --model /root/.cache/Eco-Tech/DeepSeek-V3.2-w8a8-QuaRot  --dataset-name random --random-input 200 --num-prompt 200 --request-rate 1 --save-result --result-dir ./
 ```
 
-## Function Call
+After about several minutes, you can get the performance evaluation result. With this tutorial, the performance result is:
 
-The function call feature is supported from v0.13.0rc1 on. Please use the latest version.
+**Hardware**: A3-752T, 4 node
 
-Refer to [DeepSeek-V3.2 Usage Guide](https://docs.vllm.ai/projects/recipes/en/latest/DeepSeek/DeepSeek-V3_2.html#tool-calling-example) for details.
+**Deployment**: 1P1D, Prefill node: DP2+TP16, Decode Node: DP8+TP4
+
+**Input/Output**: 64k/3k
+
+**Performance**: 255tps, TPOT 23ms

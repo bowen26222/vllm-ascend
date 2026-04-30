@@ -37,29 +37,19 @@ pip config set global.index-url https://mirrors.huaweicloud.com/repository/pypi/
 # For torch-npu dev version or x86 machine
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu/ https://mirrors.huaweicloud.com/ascend/repos/pypi"
 
-# src path
-export SRC_WORKSPACE=/vllm-workspace
-mkdir -p $SRC_WORKSPACE
-
 apt-get update -y
 apt-get install -y python3-pip git vim wget net-tools gcc g++ cmake libnuma-dev curl gnupg2
 
-git clone -b |vllm_ascend_version| --depth 1 https://github.com/vllm-project/vllm-ascend.git
-git clone --depth 1 https://github.com/vllm-project/vllm.git
+# Install vllm
+cd /vllm-project/vllm
+VLLM_TARGET_DEVICE=empty python3 -m pip -v install .
 
-# vllm
-cd $SRC_WORKSPACE/vllm
-VLLM_TARGET_DEVICE=empty python3 -m pip install .
-python3 -m pip uninstall -y triton
-
-# vllm-ascend
-cd $SRC_WORKSPACE/vllm-ascend
+# Install vllm-ascend
+cd /vllm-project/vllm-ascend
+# [IMPORTANT] Import LD_LIBRARY_PATH to enumerate the CANN environment under CPU
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/$(uname -m)-linux/devlib
-# For cpu environment, set SOC_VERSION for different chips.
-# See https://github.com/vllm-project/vllm-ascend/blob/3cb0af0bcf3299089ca7e72159fa36e825a470f8/setup.py#L132 for detail.
-export SOC_VERSION="ascend910b1"
-python3 -m pip install -v .
 python3 -m pip install -r requirements-dev.txt
+python3 -m pip install -v .
 ```
 
 ::::
@@ -241,13 +231,13 @@ VLLM_USE_MODELSCOPE=true pytest -sv tests/e2e/singlecard/test_offline_inference.
 ```bash
 cd /vllm-workspace/vllm-ascend/
 # Run all the single card tests
-VLLM_USE_MODELSCOPE=true pytest -sv tests/e2e/singlecard/
+VLLM_USE_MODELSCOPE=true pytest -sv tests/e2e/multicard/
 
 # Run a certain test script
-VLLM_USE_MODELSCOPE=true pytest -sv tests/e2e/singlecard/test_aclgraph_accuracy.py
+VLLM_USE_MODELSCOPE=true pytest -sv tests/e2e/multicard/test_dynamic_npugraph_batchsize.py
 
 # Run a certain case in test script
-VLLM_USE_MODELSCOPE=true pytest -sv tests/e2e/singlecard/test_aclgraph_accuracy.py::test_models_output
+VLLM_USE_MODELSCOPE=true pytest -sv tests/e2e/multicard/test_offline_inference.py::test_models
 ```
 
 ::::
@@ -258,7 +248,7 @@ This will reproduce the E2E test. See [vllm_ascend_test.yaml](https://github.com
 
 Run nightly multi-node test cases locally refer to section of `Running Locally` of [Multi Node Test](./multi_node_test.md).
 
-#### E2E test example
+#### E2E test example:
 
 - Offline test example: [`tests/e2e/singlecard/test_offline_inference.py`](https://github.com/vllm-project/vllm-ascend/blob/main/tests/e2e/singlecard/test_offline_inference.py)
 - Online test examples: [`tests/e2e/singlecard/test_prompt_embedding.py`](https://github.com/vllm-project/vllm-ascend/blob/main/tests/e2e/singlecard/test_prompt_embedding.py)

@@ -1,16 +1,18 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import Any, List, Optional
 
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
+from vllm.distributed.kv_transfer import (get_kv_transfer_group,
+                                          has_kv_transfer_group,
+                                          is_v1_kv_transfer_group)
 from vllm.forward_context import ForwardContext, get_forward_context
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.worker.ubatch_utils import UBatchSlice
 
-from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_device_type
+from vllm_ascend.utils import (AscendDeviceType, get_ascend_config,
+                               get_ascend_device_type)
 
 
 def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
@@ -19,7 +21,6 @@ def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
     if get_ascend_device_type() == AscendDeviceType.A5:
         return False
     from vllm.config.compilation import CUDAGraphMode
-
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
     if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
         return False
@@ -30,24 +31,20 @@ def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
 @lru_cache(maxsize=1)
 def enable_cp():
     prefill_config = get_current_vllm_config().parallel_config
-    return prefill_config.prefill_context_parallel_size > 1 or prefill_config.decode_context_parallel_size > 1
+    return prefill_config.prefill_context_parallel_size > 1 \
+                or prefill_config.decode_context_parallel_size > 1
 
 
 @dataclass
+# class AscendCommonLongSequenceMetadata:
 class AscendPrefillContextParallelMetadata:
-    """
-    Metadata for Prefill Context Parallelism (PCP) in CommonAttentionMetadata.
-
-    Contains index tensors and sequence lengths for PCP operations.
-    """
-
     pcp_allgather_restore_idx: torch.Tensor = None
 
     cp_kv_recover_idx_for_chunk: torch.Tensor = None
 
-    num_actual_tokens_pcp_padded: int = 0
+    num_actual_tokens_pcp_padded: Optional[int] = None
 
-    num_computed_tokens_of_pcp_dcp: list[list[list[int]]] | None = None
+    num_computed_tokens_of_pcp_dcp: Optional[list[list[list[int]]]] = None
 
     q_head_idx_tensor: torch.Tensor = None
 
@@ -69,15 +66,11 @@ class AscendPrefillContextParallelMetadata:
 
     q_full_idx: torch.Tensor = None
 
-    # original query_lens before pcp split
-    query_lens_pcp_full_cpu: torch.Tensor = None
-
-    # original max_query_len before pcp split
-    max_query_len_pcp_full: int = 0
+    pcp_prefill_mask: torch.Tensor = None
 
 
 @dataclass
-class AscendCommonAttentionMetadata(CommonAttentionMetadata):
+class AscendCommonAttentionMetadata:
     """
     Per-batch attention metadata, shared across layers and backends.
     AttentionMetadataBuilder instances use it to construct per-layer metadata.
@@ -85,70 +78,90 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     For many of the tensors we keep both NPU and CPU versions.
     """
 
-    # CPU tensor of sequence lengths for host-side operations.
-    # E.g., tensor([128, 256, 64]) for 3 requests with different seq lengths.
-    seq_lens_cpu: torch.Tensor = None
+    query_start_loc: torch.Tensor
+    query_start_loc_cpu: torch.Tensor
+    """(batch_size + 1,), the start location of each request in query Tensor"""
 
-    # CPU tensor of already computed tokens count per request.
-    # E.g., tensor([100, 200, 50]) means req0 has 100 tokens already computed.
-    num_computed_tokens_cpu: torch.Tensor = None
+    seq_lens_cpu: torch.Tensor
+    """(batch_size,), the length of each request including both computed tokens
+    and newly scheduled tokens"""
 
-    # Number of decode tokens per request, used for speculative decoding.
-    # E.g., 1 for normal decoding, >1 for speculative decoding.
-    decode_token_per_req: int = 1
+    seq_lens: torch.Tensor
+    """same to seq_lens_cpu, for compatibility with some new attn metadata
+    (such as GDN)."""
 
-    # Actual query sequence lengths for each token in the batch (CPU list).
-    # E.g., [1, 1, 1, 128] for 3 decode tokens and 1 prefill with 128 tokens.
-    actual_seq_lengths_q: list[int] = field(default_factory=list)
+    num_computed_tokens_cpu: torch.Tensor
+    """(batch_size,), the number of computed tokens for each request"""
 
-    # NPU tensor of position indices for rotary embeddings computation.
-    # E.g., tensor([0, 1, 2, ...]) indicating token positions in sequence.
+    num_reqs: int
+    """Number of requests"""
+    num_actual_tokens: int
+    """Total number of tokens in batch"""
+
+    max_query_len: int
+    """Max token number of request in batch"""
+
+    decode_token_per_req: int
+    """decode token number per request"""
+
+    block_table_tensor: torch.Tensor
+
+    slot_mapping: torch.Tensor
+
+    actual_seq_lengths_q: list[int]
+
     positions: torch.Tensor = None
 
-    # Current attention state (e.g., ChunkedPrefill, DecodeOnly).
+    attn_mask: torch.Tensor = None
+
+    spec_attn_mask: torch.Tensor = None
+
     attn_state: Any = None
 
-    # Padding size for graph capture, -1 means not in graph mode.
     graph_pad_size: int = -1
 
-    # Total number of tokens including padding, used for padding operations.
+    # num_input_tokens refers to total number of tokens including
+    # padding tokens. It is used to handle some padding operations.
     num_input_tokens: int = 0
 
-    # Metadata for Prefill Context Parallelism (PCP) operations.
-    prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
+    prefill_context_parallel_metadata: Optional[
+        AscendPrefillContextParallelMetadata] = None
+
+    causal: bool = True
 
     # TODO: Remove it when vLLM no longer uses this function.
-    def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
+    def unpadded(self, num_actual_tokens: int,
+                 num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
         return AscendCommonAttentionMetadata(
-            query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
-            query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
+            query_start_loc=self.query_start_loc[:num_actual_reqs + 1],
+            query_start_loc_cpu=self.query_start_loc_cpu[:num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
             seq_lens_cpu=self.seq_lens_cpu[:num_actual_reqs],
-            num_computed_tokens_cpu=self.num_computed_tokens_cpu[:num_actual_reqs],
+            num_computed_tokens_cpu=self.
+            num_computed_tokens_cpu[:num_actual_reqs],
             num_reqs=num_actual_reqs,
             num_actual_tokens=num_actual_tokens,
             max_query_len=self.max_query_len,
             decode_token_per_req=self.decode_token_per_req,
-            # NOTE: keep all tokens for block_table_tensor and slot_mapping otherwise
-            # there will be error about shape mismatch during reshape and cache.
-            # This is really strange since vLLM slices them as well
-            block_table_tensor=self.block_table_tensor,
-            slot_mapping=self.slot_mapping,
+            block_table_tensor=self.block_table_tensor[:num_actual_reqs],
+            slot_mapping=self.slot_mapping[:num_actual_tokens],
             causal=self.causal,
             actual_seq_lengths_q=self.actual_seq_lengths_q[:num_actual_tokens],
-            positions=self.positions,
+            positions=self.positions[:num_actual_tokens],
+            attn_mask=self.attn_mask,
+            spec_attn_mask=self.spec_attn_mask,
             attn_state=self.attn_state,
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
-            num_input_tokens=self.num_input_tokens,
-            prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
-            max_seq_len=self.max_seq_len,
+            num_input_tokens=num_actual_tokens,
+            prefill_context_parallel_metadata=self.
+            prefill_context_parallel_metadata,
         )
 
 
 def filter_chunked_req_indices(
     seq_len: torch.Tensor,
-    mask_for_non_zero_chunk: list[bool] | None,
+    mask_for_non_zero_chunk: Optional[List[bool]],
 ) -> torch.Tensor:
     """
     filter the reqs which are doing real chunk_prefill.
@@ -159,15 +172,14 @@ def filter_chunked_req_indices(
     Returns:
         filtered_indices: the real chunked req's indices
     """
-    assert mask_for_non_zero_chunk is not None and len(seq_len) == len(mask_for_non_zero_chunk)
+    assert mask_for_non_zero_chunk is not None and len(seq_len) == len(
+        mask_for_non_zero_chunk)
     offsets = torch.cumsum(torch.cat([torch.tensor([0]), seq_len[:-1]]), dim=0)
-    filtered_indices = torch.cat(
-        [
-            torch.arange(offsets[i], offsets[i] + seq_len[i])
-            for i in range(len(mask_for_non_zero_chunk))
-            if mask_for_non_zero_chunk[i]
-        ]
-    )
+    filtered_indices = torch.cat([
+        torch.arange(offsets[i], offsets[i] + seq_len[i])
+        for i in range(len(mask_for_non_zero_chunk))
+        if mask_for_non_zero_chunk[i]
+    ])
     return filtered_indices
 
 
@@ -178,8 +190,6 @@ def split_decodes_and_prefills(
     """
     Assuming a reordered batch, finds the boundary between prefill and decode
     requests.
-    While pcp > 1, query_lens is split across pcp ranks, so we pass in the
-    original query_lens and max_query_len to distinguish prefills and decodes.
 
     Args:
         common_attn_metadata: AscendCommonAttentionMetadata object containing the
@@ -192,10 +202,7 @@ def split_decodes_and_prefills(
         num_decode_tokens: The number of tokens in the decode requests.
         num_prefill_tokens: The number of tokens in the prefill requests.
     """
-    long_seq_metadata = common_attn_metadata.prefill_context_parallel_metadata
-    query_lens_pcp_full = long_seq_metadata.query_lens_pcp_full_cpu if long_seq_metadata else None
-    max_query_len_pcp_full = long_seq_metadata.max_query_len_pcp_full if long_seq_metadata else 0
-    max_query_len = common_attn_metadata.max_query_len if max_query_len_pcp_full == 0 else max_query_len_pcp_full
+    max_query_len = common_attn_metadata.max_query_len
     num_reqs = common_attn_metadata.num_reqs
     num_tokens = common_attn_metadata.num_actual_tokens
     query_start_loc = common_attn_metadata.query_start_loc_cpu
@@ -203,7 +210,7 @@ def split_decodes_and_prefills(
     if max_query_len <= decode_threshold:
         return num_reqs, 0, num_tokens, 0
 
-    query_lens = (query_start_loc[1:] - query_start_loc[:-1]) if query_lens_pcp_full is None else query_lens_pcp_full
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
     is_prefill = query_lens > decode_threshold
     if not torch.any(is_prefill):
         return num_reqs, 0, num_tokens, 0
@@ -232,7 +239,7 @@ def wait_for_kv_layer_from_connector(layer_name: str):
 
 def maybe_save_kv_layer_to_connector(
     layer_name: str,
-    kv_cache_layer: list[torch.Tensor],
+    kv_cache_layer: List[torch.Tensor],
 ):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -258,7 +265,8 @@ def trans_rope_weight(weight, rope_dim):
         return weight.contiguous()
     nope_part = weight[..., :-rope_dim, :]
     rope_part = weight[..., -rope_dim:, :]
-    reordered_rope_part = torch.cat((rope_part[..., ::2, :], rope_part[..., 1::2, :]), dim=-2)
+    reordered_rope_part = torch.cat(
+        (rope_part[..., ::2, :], rope_part[..., 1::2, :]), dim=-2)
     return torch.cat((nope_part, reordered_rope_part), dim=-2).contiguous()
 
 
@@ -271,11 +279,14 @@ def transdata(nd_mat, block_size: tuple = (16, 16)):
     nz_mat = torch.permute(
         torch.reshape(
             nd_mat,
-            (r // block_size[0], block_size[0], c // block_size[1], block_size[1]),
+            (r // block_size[0], block_size[0], c // block_size[1],
+             block_size[1]),
         ),
         [2, 0, 1, 3],
     )
-    nz_mat = torch.reshape(nz_mat, (nz_mat.shape[0], nz_mat.shape[1] * nz_mat.shape[2], nz_mat.shape[3]))
+    nz_mat = torch.reshape(
+        nz_mat,
+        (nz_mat.shape[0], nz_mat.shape[1] * nz_mat.shape[2], nz_mat.shape[3]))
     return nz_mat
 
 
@@ -284,24 +295,27 @@ def slice_query_start_locs(
     request_slice: slice,
 ) -> torch.Tensor:
     """
-    Creates a new query_start_loc that corresponds to the requests in
+    Creates a new query_start_loc that corresponds to the requests in 
     request_slice.
 
     Note: This function creates a new tensor to hold the new query_start_locs.
     This will break cudagraph compatibility.
     """
-    return query_start_loc[request_slice.start : request_slice.stop + 1] - query_start_loc[request_slice.start]
+    return query_start_loc[request_slice.start: request_slice.stop + 1] -\
+        query_start_loc[request_slice.start]
 
 
 def _make_metadata_with_slice(
-    ubatch_slice: UBatchSlice, attn_metadata: AscendCommonAttentionMetadata, max_num_tokens: int = 0
-) -> AscendCommonAttentionMetadata:
+        ubatch_slice: UBatchSlice,
+        attn_metadata: AscendCommonAttentionMetadata,
+        max_num_tokens: int = 0) -> AscendCommonAttentionMetadata:
     """
-    This function creates a new CommonAttentionMetadata that corresponds to
+    This function creates a new CommonAttentionMetadata that corresponds to 
     the requests included in ubatch_slice
     """
 
-    assert not ubatch_slice.is_empty(), f"Ubatch slice {ubatch_slice} is empty"
+    assert not ubatch_slice.is_empty(), (
+        f"Ubatch slice {ubatch_slice} is empty")
 
     request_slice = ubatch_slice.request_slice
     token_slice = ubatch_slice.token_slice
@@ -312,21 +326,25 @@ def _make_metadata_with_slice(
     last_req = request_slice.stop - 1
     last_tok = token_slice.stop - 1
 
-    assert start_locs[first_req] <= first_tok < start_locs[first_req + 1], "Token slice start outside of first request"
-    assert start_locs[last_req] <= last_tok < start_locs[last_req + 1], "Token slice end outside of last request"
+    assert start_locs[first_req] <= first_tok < start_locs[first_req + 1], \
+        "Token slice start outside of first request"
+    assert start_locs[last_req] <= last_tok < start_locs[last_req+1], \
+        "Token slice end outside of last request"
 
-    # If the request is split across ubatches, we have to adjust the metadata.
-    # splits_first_request: The first request in this slice is the continuation of
-    #                       a request that started in a previous slice.
-    # splits_last_request:  The last request in this slice continues into the
-    #                       next slice.
+    # If the "middle" request has tokens in both ubatches, we have to split it.
+    # If ubatch_slice is the first ubatch then we will be splitting the last
+    # request. If it's the second microbatch, then we will be splitting the
+    # first request
     splits_first_request = first_tok > start_locs[first_req]
     splits_last_request = last_tok < start_locs[last_req + 1] - 1
 
     query_start_loc_cpu = slice_query_start_locs(start_locs, request_slice)
-    query_start_loc = slice_query_start_locs(attn_metadata.query_start_loc, request_slice)
+    query_start_loc = slice_query_start_locs(attn_metadata.query_start_loc,
+                                             request_slice)
 
-    assert len(query_start_loc) >= 2, f"query_start_loc must have at least 2 elements, got {len(query_start_loc)}"
+    assert len(query_start_loc) >= 2, (
+        f"query_start_loc must have at least 2 elements, "
+        f"got {len(query_start_loc)}")
 
     if splits_first_request:
         tokens_skipped = first_tok - start_locs[first_req]
@@ -337,10 +355,7 @@ def _make_metadata_with_slice(
     seq_lens_cpu = attn_metadata.seq_lens_cpu[request_slice]
 
     if splits_last_request:
-        # NOTE: We use start_locs (the original query_start_loc_cpu) to calculate
-        # the tokens skipped because query_start_loc_cpu might have been modified
-        # if splits_first_request is True.
-        tokens_skipped = start_locs[last_req + 1] - token_slice.stop
+        tokens_skipped = query_start_loc_cpu[-1] - token_slice.stop
         query_start_loc[-1] -= tokens_skipped
         query_start_loc_cpu[-1] -= tokens_skipped
 
@@ -351,12 +366,14 @@ def _make_metadata_with_slice(
         seq_lens[-1] -= tokens_skipped
         seq_lens_cpu[-1] -= tokens_skipped
 
-    max_seq_len = int(seq_lens_cpu.max())
-    num_computed_tokens_cpu = attn_metadata.num_computed_tokens_cpu[request_slice]
+    num_computed_tokens_cpu = attn_metadata.num_computed_tokens_cpu[
+        request_slice]
 
     num_requests = request_slice.stop - request_slice.start
     num_actual_tokens = token_slice.stop - token_slice.start
-    max_query_len = int(torch.max(torch.abs(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1])).item())
+    max_query_len = int(
+        torch.max(torch.abs(query_start_loc_cpu[1:] -
+                            query_start_loc_cpu[:-1])).item())
 
     # This is to account for the case where we are in a dummy
     # run and query_start_loc_cpu is full of 0s
@@ -370,13 +387,13 @@ def _make_metadata_with_slice(
     num_input_tokens = token_slice.stop - token_slice.start
     positions = attn_metadata.positions[token_slice]
     attn_state = attn_metadata.attn_state
-    # if attn_metadata.attn_state != AscendAttentionState.ChunkedPrefill:
-    # attn_mask = attn_metadata.attn_mask
+    #if attn_metadata.attn_state != AscendAttentionState.ChunkedPrefill:
+    attn_mask = attn_metadata.attn_mask
 
     if len(attn_metadata.actual_seq_lengths_q) > 0:
         actual_seq_lengths_q = list(
-            range(attn_metadata.decode_token_per_req, max_num_tokens + 1, attn_metadata.decode_token_per_req)
-        )
+            range(attn_metadata.decode_token_per_req, max_num_tokens + 1,
+                  attn_metadata.decode_token_per_req))
     else:
         actual_seq_lengths_q = []
 
@@ -389,17 +406,16 @@ def _make_metadata_with_slice(
         num_actual_tokens=num_actual_tokens,
         num_input_tokens=num_input_tokens,
         actual_seq_lengths_q=actual_seq_lengths_q,
+        num_computed_tokens_cpu=num_computed_tokens_cpu,
+        max_query_len=max_query_len,
         block_table_tensor=block_table_tensor,
         slot_mapping=slot_mapping,
-        num_computed_tokens_cpu=num_computed_tokens_cpu,
         positions=positions,
+        attn_mask=attn_mask,
+        spec_attn_mask=attn_metadata.spec_attn_mask,
         attn_state=attn_state,
-        max_query_len=max_query_len,
-        decode_token_per_req=attn_metadata.decode_token_per_req,
-        max_seq_len=max_seq_len,
-        # attn_mask=attn_mask,
-        # spec_attn_mask=attn_metadata.spec_attn_mask,
         graph_pad_size=attn_metadata.graph_pad_size,
+        decode_token_per_req=attn_metadata.decode_token_per_req,
     )
 
 
@@ -409,13 +425,15 @@ def split_attn_metadata(
     max_num_tokens: int = 0,
 ) -> list[AscendCommonAttentionMetadata]:
     """
-    Creates a new CommonAttentionMetadata instance that corresponds to the
+    Creates a new CommonAttentionMetadata instance that corresponds to the 
     requests for each UBatchSlice in ubatch_slices.
 
     Note: This function does not modify common_attn_metadata
     """
     results = []
     for ubatch_slice in ubatch_slices:
-        results.append(_make_metadata_with_slice(ubatch_slice, common_attn_metadata, max_num_tokens))
+        results.append(
+            _make_metadata_with_slice(ubatch_slice, common_attn_metadata,
+                                      max_num_tokens))
 
     return results

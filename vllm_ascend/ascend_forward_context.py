@@ -1,26 +1,27 @@
 import math
 from contextlib import contextmanager
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parallel_world_size
-from vllm.forward_context import BatchDescriptor, DPMetadata, ForwardContext, get_forward_context, set_forward_context
+from vllm.distributed import (get_dp_group, get_ep_group,
+                              get_tensor_model_parallel_world_size)
+from vllm.forward_context import (BatchDescriptor, get_forward_context,
+                                  set_forward_context, DPMetadata,
+                                  ForwardContext)
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.utils import (
-    AscendDeviceType,
-    enable_sp,
-    flashcomm2_enable,
-    get_ascend_device_type,
-    has_layer_idx,
-    is_drafter_moe_model,
-    is_moe_model,
-    speculative_enable_dispatch_gmm_combine_decode,
-)
+from vllm_ascend.utils import (AscendDeviceType, enable_sp, flashcomm2_enable,
+                               get_ascend_device_type, has_layer_idx,
+                               is_moe_model)
+
+if TYPE_CHECKING:
+    from vllm_ascend.ops.weight_prefetch import WeightPrefetchMethod
+else:
+    WeightPrefetchMethod = None
 
 
 class MoECommType(Enum):
@@ -32,71 +33,77 @@ class MoECommType(Enum):
 
 @contextmanager
 def set_ascend_forward_context(
-    attn_metadata: Any,
-    vllm_config: VllmConfig,
-    virtual_engine: int = 0,
-    num_tokens: int = 0,
-    num_tokens_across_dp: torch.Tensor | None = None,
-    in_profile_run: bool = False,
-    num_actual_tokens: int | None = None,
-    aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-    batch_descriptor: BatchDescriptor | None = None,
-    model_instance: torch.nn.Module = None,
-    is_draft_model=False,
-    ubatch_slices: UBatchSlices | None = None,
-):
+        attn_metadata: Any,
+        vllm_config: VllmConfig,
+        virtual_engine: int = 0,
+        num_tokens: int = 0,
+        num_tokens_across_dp: Optional[torch.Tensor] = None,
+        with_prefill: bool = True,
+        in_profile_run: bool = False,
+        num_actual_tokens: Optional[int] = None,
+        aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        batch_descriptor: Optional[BatchDescriptor] = None,
+        prefetch_stream: torch.npu.Stream = None,
+        model_instance: torch.nn.Module = None,
+        weight_prefetch_method: Optional[WeightPrefetchMethod] = None,
+        is_mtp_model=False,
+        in_parallel_streams: bool = False,
+        ubatch_slices: Optional[UBatchSlices] = None):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     We add some additional param into forward_context.
     """
     with set_forward_context(
-        attn_metadata,
-        vllm_config,
-        virtual_engine=virtual_engine,
-        num_tokens=num_tokens,
-        num_tokens_across_dp=num_tokens_across_dp,
-        cudagraph_runtime_mode=aclgraph_runtime_mode,
-        batch_descriptor=batch_descriptor,
-        ubatch_slices=ubatch_slices,
+            attn_metadata,
+            vllm_config,
+            virtual_engine=virtual_engine,
+            num_tokens=num_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_runtime_mode=aclgraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
+            ubatch_slices=ubatch_slices,
     ):
         forward_context = get_forward_context()
 
-        from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
-
-        moe_comm_type = select_moe_comm_method(num_tokens, vllm_config, is_draft_model)
+        from vllm_ascend.ops.fused_moe.moe_comm_method import \
+            get_moe_comm_method
+        moe_comm_type = select_moe_comm_method(num_tokens, vllm_config,
+                                               is_mtp_model)
         forward_context.moe_comm_type = moe_comm_type
         forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
 
+        forward_context.with_prefill = with_prefill
         tp_world_size = get_tensor_model_parallel_world_size()
 
         forward_context.in_profile_run = in_profile_run
+        forward_context.in_parallel_streams = in_parallel_streams
 
         # NOTE: This cannot be set using set_forward_context
         # due to multiple warmups before actual capturing
         forward_context.capturing = False
 
-        # set for sequence parallelism, 1000 is the batch size concurrency threshold
-        # for enabling the flashcomm_v1 or sequence_parallelism feature.
-        # Currently, it is an empirical value. In normal scenarios, if the concurrency
-        # exceeds this threshold, the performance benefits can be maximized.
-        # Conversely, if the concurrency is below the threshold,
+        # set for sequence parallelism, 1000 is the batch size concurrency threshold for enabling the flashcomm_v1 or sequence_parallelism feature.
+        # Currently, it is an empirical value. In normal scenarios, if the concurrency exceeds this threshold,
+        # the performance benefits can be maximized. Conversely, if the concurrency is below the threshold,
         # the performance may degrade due to the switching of communication methods.
         mmrs_fusion = True
-        # main model and drafter model may have different architecture
-        is_context_moe_model = is_drafter_moe_model(vllm_config) if is_draft_model else is_moe_model(vllm_config)
-        if is_context_moe_model:
+        if is_moe_model(vllm_config):
             sp_enabled = enable_sp(vllm_config) and num_tokens is not None
             mmrs_fusion = False
         else:
-            sp_enabled = enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
+            sp_enabled = enable_sp(vllm_config) and \
+                num_tokens is not None and num_tokens > 1000
         forward_context.mmrs_fusion = mmrs_fusion
         forward_context.num_tokens = num_tokens
         forward_context.sp_enabled = sp_enabled
         # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2
-        forward_context.flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1 and num_tokens is not None
+        forward_context.flashcomm_v2_enabled = flashcomm2_enable(
+        ) and tp_world_size > 1 and num_tokens is not None
 
-        if forward_context.sp_enabled or forward_context.flashcomm_v2_enabled:
-            pad_size = (tp_world_size - (num_tokens % tp_world_size)) % tp_world_size
+        if (forward_context.sp_enabled
+                or forward_context.flashcomm_v2_enabled):
+            pad_size = (tp_world_size -
+                        (num_tokens % tp_world_size)) % tp_world_size
             forward_context.pad_size = pad_size
 
         # set this for rope forward_oot using
@@ -109,7 +116,6 @@ def set_ascend_forward_context(
         forward_context.dbo_enabled = False
         # set this for sync dbo in the first layer after embedding
         forward_context.dbo_first_layer_sync = True
-        forward_context.dbo_template = None
 
         # set layer_idx to enable optimization features that depend on this information.
         # This is only applicable to models that contain these necessary attributes.
@@ -119,27 +125,31 @@ def set_ascend_forward_context(
 
         # TODO(rjg-lyh): refactor mlp weight prefetch method
         # set for mlp weight prefetch
-        prefetch_mlp_enabled = (
-            envs_ascend.VLLM_ASCEND_ENABLE_PREFETCH_MLP
-            and forward_context.layer_idx is not None
-            and num_tokens is not None
-            and num_tokens < 500
-        )
+        prefetch_mlp_enabled = envs_ascend.VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE and \
+            envs_ascend.VLLM_ASCEND_ENABLE_PREFETCH_MLP and \
+            forward_context.layer_idx is not None and \
+            num_tokens is not None and num_tokens < 500
         if prefetch_mlp_enabled:
+            forward_context.prefetch_stream = prefetch_stream
+            forward_context.model_instance = model_instance
             forward_context.prefetch_mlp_gate_up_proj = False
             forward_context.prefetch_mlp_down_proj = False
         forward_context.prefetch_mlp_enabled = prefetch_mlp_enabled
         forward_context.model_instance = model_instance
-        forward_context.is_draft_model = is_draft_model
+        forward_context.weight_prefetch_method = weight_prefetch_method
+        forward_context.is_mtp_model = is_mtp_model
 
         if num_tokens is None and attn_metadata is not None:
             num_tokens = attn_metadata.num_actual_tokens
 
         dp_world_size = get_dp_group().world_size
         if dp_world_size > 1 and forward_context.dp_metadata is not None:
-            max_tokens_across_dp = forward_context.dp_metadata.max_tokens_across_dp_cpu.item()
-            if forward_context.sp_enabled or forward_context.flashcomm_v2_enabled:
-                padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
+            max_tokens_across_dp = \
+                forward_context.dp_metadata.max_tokens_across_dp_cpu.item()
+            if (forward_context.sp_enabled
+                    or forward_context.flashcomm_v2_enabled):
+                padded_length = (max_tokens_across_dp + tp_world_size -
+                                 1) // tp_world_size * tp_world_size
                 pad_size = padded_length - num_tokens
                 forward_context.padded_length = padded_length
                 forward_context.pad_size = pad_size
@@ -152,10 +162,12 @@ def set_ascend_forward_context(
             if num_actual_tokens is None:
                 num_actual_tokens = num_tokens
             # NOTE: token num which need to pad to when mc2
-            forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
+            forward_context.padded_num_tokens = math.ceil(
+                max_tokens_across_dp / tp_world_size) * tp_world_size
             reserved_mc2_mask = get_mc2_mask()
             if reserved_mc2_mask is not None:
-                mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
+                mc2_mask = reserved_mc2_mask[:forward_context.
+                                             padded_num_tokens]
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
                 forward_context.mc2_mask = mc2_mask
@@ -173,52 +185,63 @@ def create_ascend_forward_context(
     ubatch_slices: list[UBatchSlices],
     virtual_engine: int = 0,
     ubatch_num: int = 0,
-    dp_metadata: DPMetadata | None = None,
+    dp_metadata: Optional[DPMetadata] = None,
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-    batch_descriptor: BatchDescriptor | None = None,
-    reserved_mc2_mask: torch.Tensor | None = None,
+    batch_descriptor: Optional[BatchDescriptor] = None,
+    reserved_mc2_mask: Optional[torch.Tensor] = None,
     positions: Any = None,
-    dbo_template: Any = None,
+    in_parallel_streams: Optional[bool] = None,
+    cos_sin_slot_id: int = 0,
 ):
     new_forward_context = ForwardContext(
-        no_compile_layers=vllm_config.compilation_config.static_forward_context,
+        no_compile_layers=vllm_config.compilation_config.
+        static_forward_context,
         virtual_engine=virtual_engine,
         attn_metadata=attn_metadata,
         dp_metadata=dp_metadata,
         cudagraph_runtime_mode=cudagraph_runtime_mode,
         batch_descriptor=batch_descriptor,
-        ubatch_slices=ubatch_slices,
-    )
+        ubatch_slices=ubatch_slices)
 
+    attn_metadata_i = next(iter(attn_metadata.values()))
     new_forward_context.sp_enabled = cur_forward_context.sp_enabled
-
-    new_forward_context.num_tokens = ubatch_slices[ubatch_num].num_tokens
-
+    new_forward_context.num_tokens = attn_metadata_i.num_actual_tokens
     tp_world_size = get_tensor_model_parallel_world_size()
     dp_world_size = get_dp_group().world_size
 
     new_forward_context.flashcomm_v2_enabled = cur_forward_context.flashcomm_v2_enabled
-    if new_forward_context.sp_enabled or new_forward_context.flashcomm_v2_enabled:
-        pad_size = (tp_world_size - (new_forward_context.num_tokens % tp_world_size)) % tp_world_size
+    if (new_forward_context.sp_enabled
+            or new_forward_context.flashcomm_v2_enabled):
+        pad_size = (
+            tp_world_size -
+            (new_forward_context.num_tokens % tp_world_size)) % tp_world_size
         new_forward_context.pad_size = pad_size
 
     if dp_world_size > 1 and new_forward_context.dp_metadata is not None:
-        max_tokens_across_dp = new_forward_context.dp_metadata.max_tokens_across_dp_cpu.item()
-        if new_forward_context.sp_enabled or new_forward_context.flashcomm_v2_enabled:
+        max_tokens_across_dp = new_forward_context.dp_metadata.max_tokens_across_dp_cpu.item(
+        )
+        if (new_forward_context.sp_enabled
+                or new_forward_context.flashcomm_v2_enabled):
             new_forward_context.padded_length = (
-                (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
-            )
+                max_tokens_across_dp + tp_world_size -
+                1) // tp_world_size * tp_world_size
             new_forward_context.pad_size = new_forward_context.padded_length - new_forward_context.num_tokens
     else:
         max_tokens_across_dp = new_forward_context.num_tokens
     new_forward_context.max_tokens_across_dp = max_tokens_across_dp
 
     new_forward_context.moe_comm_type = cur_forward_context.moe_comm_type
-    from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
-
+    from vllm_ascend.ops.fused_moe.moe_comm_method import \
+        get_moe_comm_method
     # set for different microbatches
-    new_forward_context.moe_comm_method = get_moe_comm_method(new_forward_context.moe_comm_type, ubatch_num)
+    new_forward_context.moe_comm_method = get_moe_comm_method(
+        new_forward_context.moe_comm_type, ubatch_num)
+    new_forward_context.with_prefill = cur_forward_context.with_prefill
     new_forward_context.in_profile_run = cur_forward_context.in_profile_run
+    if in_parallel_streams is None:
+        in_parallel_streams = bool(
+            getattr(cur_forward_context, "in_parallel_streams", False))
+    new_forward_context.in_parallel_streams = in_parallel_streams
     new_forward_context.capturing = cur_forward_context.capturing
     new_forward_context.mmrs_fusion = cur_forward_context.mmrs_fusion
 
@@ -226,63 +249,68 @@ def create_ascend_forward_context(
     new_forward_context.layer_idx = cur_forward_context.layer_idx
     new_forward_context.model_instance = cur_forward_context.model_instance
     new_forward_context.prefetch_mlp_enabled = cur_forward_context.prefetch_mlp_enabled
-    new_forward_context.is_draft_model = cur_forward_context.is_draft_model
-    new_forward_context.dbo_template = dbo_template
+    new_forward_context.weight_prefetch_method = cur_forward_context.weight_prefetch_method
+    new_forward_context.is_mtp_model = cur_forward_context.is_mtp_model
 
     if new_forward_context.num_tokens:
-        new_forward_context.padded_num_tokens = (
-            math.ceil(new_forward_context.max_tokens_across_dp / tp_world_size) * tp_world_size
-        )
+        new_forward_context.padded_num_tokens = math.ceil(
+            new_forward_context.max_tokens_across_dp /
+            tp_world_size) * tp_world_size
         if get_mc2_mask() is not None:
             reserved_mc2_mask = torch.zeros(
                 cur_forward_context.mc2_mask.shape,
                 dtype=cur_forward_context.mc2_mask.dtype,
                 device=cur_forward_context.mc2_mask.device,
             )
-            mc2_mask = reserved_mc2_mask[: cur_forward_context.padded_num_tokens]
-            mc2_mask[: new_forward_context.num_tokens] = True
-            mc2_mask[new_forward_context.num_tokens :] = False
+            mc2_mask = reserved_mc2_mask[:cur_forward_context.
+                                         padded_num_tokens]
+            mc2_mask[:new_forward_context.num_tokens] = True
+            mc2_mask[new_forward_context.num_tokens:] = False
             new_forward_context.mc2_mask = mc2_mask
 
     new_forward_context.dbo_enabled = True
     new_forward_context.dbo_first_layer_sync = True
+    new_forward_context.cos_sin_slot_id = cos_sin_slot_id
 
     # vllm-ascend use global cos/sin cache, which should be sliced when using dbo
-    from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla, get_cos_and_sin_slice, update_cos_sin
-
+    from vllm_ascend.ops.rotary_embedding import update_cos_sin, get_cos_and_sin_slice, get_cos_and_sin_mla
     if ubatch_slices and ubatch_slices[ubatch_num]:
         token_slice = ubatch_slices[ubatch_num].token_slice
         positions = positions[token_slice]
         # slice cos_mla/sin_mla for dbo
         num_speculative_tokens = (
-            vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0
-        )
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config else 0)
         decode_token_per_req = 1 + num_speculative_tokens
         mla_slice = slice(
-            ubatch_slices[ubatch_num].request_slice.start * decode_token_per_req,
-            ubatch_slices[ubatch_num].request_slice.stop * decode_token_per_req,
-        )
-        update_cos_sin(positions)
-        cos_slice, sin_slice = get_cos_and_sin_slice()
-        new_forward_context.cos = cos_slice.clone() if cos_slice is not None else None
-        new_forward_context.sin = sin_slice.clone() if sin_slice is not None else None
+            ubatch_slices[ubatch_num].request_slice.start *
+            decode_token_per_req,
+            ubatch_slices[ubatch_num].request_slice.stop *
+            decode_token_per_req)
+        update_cos_sin(positions, slot_id=cos_sin_slot_id)
+        cos_slice, sin_slice = get_cos_and_sin_slice(slot_id=cos_sin_slot_id)
+        new_forward_context.cos = cos_slice.clone()
+        new_forward_context.sin = sin_slice.clone()
 
-        cos_mla, sin_mla = get_cos_and_sin_mla(positions)
+        cos_mla, sin_mla = get_cos_and_sin_mla()
 
-        new_forward_context.cos_mla = cos_mla[mla_slice] if cos_mla is not None else None
+        new_forward_context.cos_mla = cos_mla[
+            mla_slice] if cos_mla is not None else None
 
-        new_forward_context.sin_mla = sin_mla[mla_slice] if sin_mla is not None else None
+        new_forward_context.sin_mla = sin_mla[
+            mla_slice] if sin_mla is not None else None
 
     return new_forward_context
 
 
-_mc2_tokens_capacity: int | None = None
-_reserved_mc2_mask: torch.Tensor | None = None
-_sin: torch.Tensor | None = None
-_cos: torch.Tensor | None = None
+_mc2_tokens_capacity: Optional[int] = None
+_reserved_mc2_mask: Optional[torch.Tensor] = None
+_sin: Optional[torch.Tensor] = None
+_cos: Optional[torch.Tensor] = None
 
 
-def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len):
+def set_mc2_tokens_capacity(vllm_config, max_num_reqs,
+                            uniform_decode_query_len):
     global _mc2_tokens_capacity
     if _mc2_tokens_capacity is not None:
         return
@@ -306,7 +334,9 @@ def set_mc2_mask(vllm_config, device):
     if _reserved_mc2_mask is not None:
         return
     if is_moe_model(vllm_config):
-        _reserved_mc2_mask = torch.zeros(get_mc2_tokens_capacity(), dtype=torch.bool, device=device)
+        _reserved_mc2_mask = torch.zeros(get_mc2_tokens_capacity(),
+                                         dtype=torch.bool,
+                                         device=device)
     else:
         _reserved_mc2_mask = None
 
@@ -315,7 +345,9 @@ def get_mc2_mask():
     return _reserved_mc2_mask
 
 
-def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_model=False) -> MoECommType | None:
+def select_moe_comm_method(num_tokens: int,
+                           vllm_config: VllmConfig,
+                           is_mtp_model=False) -> Optional[MoECommType]:
     """Select the MoE communication method according to parallel settings,
     device generation, token count, and quantization.
 
@@ -330,7 +362,7 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
     Args:
         num_tokens (int): The number of tokens in the current batch.
         vllm_config (VllmConfig): Runtime configuration for the model.
-        is_draft_model (bool): Whether the model runs in MTP mode (disables fused MC2).
+        is_mtp_model (bool): Whether the model runs in MTP mode (disables fused MC2).
 
     Raises:
         ValueError: If the soc version is unsupported.
@@ -343,40 +375,38 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     soc_version = get_ascend_device_type()
     quant_type = getattr(
-        vllm_config.model_config.hf_text_config,
-        "moe_quantize",
-        getattr(vllm_config.model_config.hf_text_config, "quantize", None),
-    )
+        vllm_config.model_config.hf_config, 'moe_quantize',
+        getattr(vllm_config.model_config.hf_config, 'quantize', None))
 
-    if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
+    if not vllm_config.parallel_config.enable_expert_parallel:
         moe_comm_type = MoECommType.ALLGATHER
     elif soc_version in {AscendDeviceType.A2}:
-        if (
-            num_tokens <= mc2_tokens_capacity
-            and vllm_config.parallel_config.world_size_across_dp / vllm_config.parallel_config.pipeline_parallel_size
-            >= 16
-        ):
+        if (num_tokens <= mc2_tokens_capacity
+                and vllm_config.parallel_config.world_size_across_dp /
+                vllm_config.parallel_config.pipeline_parallel_size >= 16):
             moe_comm_type = MoECommType.MC2
         else:
             moe_comm_type = MoECommType.ALLGATHER
 
     elif soc_version in {AscendDeviceType.A3}:
-        dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
+        ascend_config = get_ascend_config()
+        dynamic_eplb = ascend_config.dynamic_eplb or ascend_config.expert_map_record_path
         # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
-        # TODO: drop speculative method guard when dispatch_gmm_combine_decode supports w16a16
-        fused_mc2_enable = envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 and quant_type == "w8a8_dynamic"
-        dispatch_ffn_combine_enable = get_ep_group().world_size <= 32 and (not is_draft_model) and (not dynamic_eplb)
+        # TODO: drop dynamic_eplb guard when dispatch_gmm_combine_decode supports tensor list inputs
+        # TODO: add guard for dispatch_gmm_combine_decode when mtp uses float while moe uses w8a8
+        fused_mc2_enable = envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 and quant_type == "w8a8_dynamic" and (
+            not dynamic_eplb)
         if num_tokens <= mc2_tokens_capacity:
             fused_decode_enable = fused_mc2_enable
             if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
-                fused_decode_enable = fused_mc2_enable and dispatch_ffn_combine_enable
-            elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
-                fused_decode_enable = fused_mc2_enable and speculative_enable_dispatch_gmm_combine_decode(vllm_config)
+                fused_decode_enable = fused_mc2_enable and get_ep_group(
+                ).world_size <= 16 and (not is_mtp_model)
             moe_comm_type = MoECommType.FUSED_MC2 if fused_decode_enable else MoECommType.MC2
         else:
             fused_prefill_enable = fused_mc2_enable
             if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
-                fused_prefill_enable = fused_mc2_enable and dispatch_ffn_combine_enable
+                fused_prefill_enable = fused_mc2_enable and get_ep_group(
+                ).world_size <= 16 and (not is_mtp_model)
             elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
                 fused_prefill_enable = False
             moe_comm_type = MoECommType.FUSED_MC2 if fused_prefill_enable else MoECommType.ALLTOALL

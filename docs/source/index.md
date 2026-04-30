@@ -46,7 +46,6 @@ faqs
 user_guide/support_matrix/index
 user_guide/configuration/index
 user_guide/feature_guide/index
-user_guide/deployment_guide/index
 user_guide/release_notes
 :::
 

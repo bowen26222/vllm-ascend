@@ -1,0 +1,8 @@
+{
+  "split_batch_config": {
+    "enabled": true,
+    "enable_parallel_streams": true,
+    "num_splits": 2,
+    "min_batch_size_for_split": 4
+  }
+}

@@ -19,33 +19,83 @@
 
 # isort: skip_file
 import os
+import argparse
+from pathlib import Path
+import time
 
 os.environ["VLLM_USE_MODELSCOPE"] = "True"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from vllm import LLM, SamplingParams
+import torch
+
+
+def parse_args():
+  parser = argparse.ArgumentParser(description="Offline Inference with Profiling")
+  parser.add_argument(
+      "--enable-profiling",
+      default=False,
+      action="store_true",
+      help="Enable PyTorch profiling"
+  )
+  parser.add_argument(
+      "--profile-dir",
+      type=str,
+      default="./prof_result/offline_inference_npu",
+      help="Directory to save profiling results"
+  )
+  parser.add_argument(
+      "--model",
+      type=str,
+      default="Qwen/Qwen3-4B",
+      help="Model name or path"
+  )
+  parser.add_argument(
+      "--max-tokens",
+      type=int,
+      default=100,
+      help="Maximum number of tokens to generate"
+  )
+  parser.add_argument(
+      "--temperature",
+      type=float,
+      default=0.0,
+      help="Sampling temperature"
+  )
+  return parser.parse_args()
 
 
 def main():
-    prompts = [
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
-    ]
+  args = parse_args()
+  
+  prompts = [
+      "Hello, my name is",
+      "The president of the United States is",
+      "The capital of France is",
+      "The future of AI is",
+  ]
+  
+  compilation_config = {
+      "cudagraph_mode": "FULL_DECODE_ONLY",
+  }
+  
+  # Create a sampling params object.
+  sampling_params = SamplingParams(max_tokens=100, temperature=0.0)
+  
+  # Create an LLM.
+  llm = LLM(model="Qwen/Qwen3-0.6B", compilation_config=compilation_config)
 
-    # Create a sampling params object.
-    sampling_params = SamplingParams(max_tokens=100, temperature=0.0)
-    # Create an LLM.
-    llm = LLM(model="Qwen/Qwen2.5-0.5B-Instruct")
-
-    # Generate texts from the prompts.
-    outputs = llm.generate(prompts, sampling_params)
-    for output in outputs:
-        prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+  # Setup profiling if enabled
+ 
+  print("Starting generation...")
+  outputs = llm.generate(prompts, sampling_params)
+  
+  # Print results
+  for output in outputs:
+      prompt = output.prompt
+      generated_text = output.outputs[0].text
+      print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 
 
 if __name__ == "__main__":
-    main()
+  main()

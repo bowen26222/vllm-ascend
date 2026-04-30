@@ -19,17 +19,10 @@ import einops
 import torch
 import torch.nn.functional as F
 import torch_npu
+from vllm.attention.layers.mm_encoder_attention import MMEncoderAttention
 from vllm.config import MultiModalConfig
 
 import vllm_ascend.envs as envs_ascend
-from vllm_ascend.utils import vllm_version_is
-
-# isort: off
-if vllm_version_is('0.13.0'):
-    from vllm.attention.layers.mm_encoder_attention import MMEncoderAttention  # type: ignore
-else:
-    from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention  # type: ignore
-# isort: on
 
 MIN_PAD_SIZE = 64  # min_size to pad weight
 MAX_PAD_SIZE = 128  # max_size to pad weight
@@ -65,30 +58,6 @@ class AscendMMEncoderAttention(MMEncoderAttention):
             multimodal_config=multimodal_config,
         )
 
-    def reshape_qkv_to_3d(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        bsz: int,
-        q_len: int,
-        kv_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Reshape query, key, value to 3D tensors:
-        (batch_size * seq_len, num_heads, head_size)
-        """
-        query = query.view(bsz * q_len, self.num_heads, self.head_size)
-        key = key.view(bsz * kv_len, self.num_kv_heads, self.head_size)
-        value = value.view(bsz * kv_len, self.num_kv_heads, self.head_size)
-        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
-        if (num_repeat := self.num_queries_per_kv) > 1:
-            # Handle MQA and GQA
-            key = torch.repeat_interleave(key, num_repeat, dim=1)
-            value = torch.repeat_interleave(value, num_repeat, dim=1)
-
-        return query, key, value
-
     def forward_oot(
             self,
             query: torch.Tensor,
@@ -100,7 +69,6 @@ class AscendMMEncoderAttention(MMEncoderAttention):
     ):
         bsz, q_len = query.size()[:2]
         kv_len = key.size(1)
-        is_reshaped = query.dim() == 4
 
         # q, k, v: [b, s, head, head_dim] -> [b * s, head, head_dim]
         q, k, v = self.reshape_qkv_to_3d(query, key, value, bsz, q_len, kv_len)
@@ -118,13 +86,6 @@ class AscendMMEncoderAttention(MMEncoderAttention):
             v = F.pad(v, (0, pad_len), mode="constant", value=0)
 
         context_layer = torch.empty_like(q)
-
-        if cu_seqlens is None:
-            cu_seqlens = torch.arange(0, (bsz + 1) * q_len,
-                                      step=q_len,
-                                      dtype=torch.int32,
-                                      device=query.device)
-
         cu_seqlens = torch.diff(cu_seqlens).to("cpu")
 
         # operator requires pta version >= 2.5.1
@@ -142,12 +103,7 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         if enable_pad:
             context_layer = context_layer[..., :origin_shape]
 
-        if is_reshaped:
-            context_layer = einops.rearrange(context_layer,
-                                             "(b s) h d -> b s h d",
-                                             b=bsz).contiguous()
-        else:
-            context_layer = einops.rearrange(context_layer,
-                                             "(b s) h d -> b s (h d)",
-                                             b=bsz).contiguous()
+        context_layer = einops.rearrange(context_layer,
+                                         "(b s) h d -> s b (h d)",
+                                         b=bsz).contiguous()
         return context_layer

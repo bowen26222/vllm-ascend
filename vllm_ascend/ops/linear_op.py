@@ -21,7 +21,6 @@ CustomLinearOp
 ├── CustomColumnParallelOp
 │   ├── MLPColumnParallelOp
 │   ├── SequenceColumnParallelOp
-│   ├── Flashcomm2OshardQKVParallelOp
 └── CustomRowParallelOp
 │   ├── MLPRowParallelOp
 │   ├── OProjRowParallelOp
@@ -39,7 +38,6 @@ Row parallel op follows a similar approach - inherit from RowColumnParallelOp an
 
 import re
 from functools import lru_cache
-from types import SimpleNamespace
 from typing import Optional, Union
 
 import torch
@@ -50,23 +48,27 @@ from torch import nn
 from torch.distributed import ProcessGroup
 from torch.nn.parameter import Parameter
 from vllm.distributed import (split_tensor_along_last_dim,
-                              tensor_model_parallel_all_gather,
                               tensor_model_parallel_all_reduce,
+                              tensor_model_parallel_all_gather,
                               tensor_model_parallel_reduce_scatter)
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_tp_group, get_ep_group
 from vllm.forward_context import get_forward_context
 
-from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.distributed.parallel_state import (get_flashcomm2_odp_group,
                                                     get_flashcomm2_otp_group,
                                                     get_mlp_tp_group,
                                                     get_otp_group)
-from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
-from vllm_ascend.utils import (enable_dsa_cp, enable_sp, flashcomm2_enable,
+from vllm_ascend.utils import (dense_optim_enable, enable_sp,
+                               flashcomm2_enable,
                                get_flashcomm2_reorgnized_batch_ids,
                                matmul_allreduce_enable, mlp_tp_enable,
                                oproj_tp_enable, shared_expert_dp_enabled)
+
+from vllm_ascend.worker.ubatching import (dbo_record_current_stream,
+                                          dbo_wait_current_stream_and_yield,
+                                          UBatchEventKey)
 
 
 class CustomLinearOp:
@@ -139,7 +141,7 @@ class CustomRowParallelOp(CustomLinearOp):
 
     def apply(self, input_):
         output, output_bias = self.apply_impl(input_)
-        if envs_ascend.VLLM_ASCEND_ENABLE_PREFETCH_MLP:
+        if dense_optim_enable():
             torch.ops.vllm.maybe_prefetch_mlp_gate_up_proj(output, self.prefix)
         if not self.return_bias:
             return output
@@ -418,9 +420,6 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
         super().update_attrs()
         self.input_is_parallel = self.layer.input_is_parallel
         self.input_size_per_partition = self.layer.input_size_per_partition
-        if flashcomm2_oshard_manager.flashcomm2_oshard_enable():
-            flashcomm2_oshard_manager.register_layer(self.layer,
-                                                     prefetch_step=1)
 
 
 class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
@@ -444,7 +443,7 @@ class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         if self.reduce_results and self.tp_size > 1:
             output = torch_npu.npu_mm_all_reduce_base(input_parallel,
-                                                      self.layer.weight.t(),
+                                                      self.weight_t,
                                                       self.hcomm_info,
                                                       bias=bias_)
         else:
@@ -470,6 +469,10 @@ class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
         else:
             cls._HCOMM_INFO = group.get_hccl_comm_name(rank)
         return cls._HCOMM_INFO
+
+    def update_attrs(self):
+        super().update_attrs()
+        self.weight_t = self.layer.weight.t()
 
 
 class SequenceColumnParallelOp(CustomColumnParallelOp):
@@ -515,44 +518,7 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
         return output, output_bias
 
 
-class Flashcomm2OshardQKVParallelOp(CustomColumnParallelOp):
-
-    def __init__(self, layer):
-        super().__init__(layer)
-
-    def apply_impl(
-        self, input_: torch.Tensor
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
-        """Column-parallel linear with FlashComm2 OShard optimization."""
-
-        bias = self.bias if not self.skip_bias_add else None
-
-        # Matrix multiply.
-        assert self.quant_method is not None
-
-        if enable_sp():
-            input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
-                input_, True)
-
-        # Trigger async broadcast before matmul to overlap communication.
-        flashcomm2_oshard_manager.trigger_broadcast_for_layer(
-            self.layer.prefix)
-
-        output_parallel = self.quant_method.apply(self.layer, input_, bias)
-        if self.gather_output and self.tp_size > 1:
-            # All-gather across the partitions.
-            output = self.comm_group.all_gather(output_parallel)
-        else:
-            output = output_parallel
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
-
-
 class SequenceRowParallelOp(CustomRowParallelOp):
-
-    def __init__(self, layer):
-        super().__init__(layer)
-        self.unique_prefix = None
 
     def apply_impl(
         self, input_: torch.Tensor
@@ -579,7 +545,7 @@ class SequenceRowParallelOp(CustomRowParallelOp):
                                              bias=bias_)
         else:
             output = torch.ops.vllm.matmul_and_reduce(input_parallel,
-                                                      self.unique_prefix)
+                                                      self.prefix)
 
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
@@ -682,69 +648,14 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         super().update_attrs()
         self.input_is_parallel = self.layer.input_is_parallel
         self.reduce_results = self.layer.reduce_results
-        self.unique_prefix = self.layer.unique_prefix
-
-
-class ShardedCPRowParallelOp(CustomRowParallelOp):
-
-    @property
-    def comm_group(self):
-        # fake comm group to bypass tp logic
-        return SimpleNamespace(world_size=1,
-                               rank_in_group=0,
-                               device_group=None)
-
-    def apply_impl(
-        self,
-        input_,
-    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        assert self.quant_method is not None
-        output = self.quant_method.apply(self.layer, input_, bias_)
-        output_bias = self.bias if self.skip_bias_add else None
-        if not self.return_bias:
-            return output
-        return output, output_bias
-
-    def update_attrs(self):
-        super().update_attrs()
-        self.layer.reduce_results = False
-
-
-class ShardedCPColumnParallelOp(CustomColumnParallelOp):
-
-    @property
-    def comm_group(self):
-        # fake comm group to bypass tp logic
-        return SimpleNamespace(world_size=1,
-                               rank_in_group=0,
-                               device_group=None)
-
-    def apply_impl(
-        self,
-        input_,
-    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        bias = self.bias if not self.skip_bias_add else None
-        assert self.quant_method is not None
-        output = self.quant_method.apply(self.layer, input_, bias)
-        output_bias = self.bias if self.skip_bias_add else None
-        if not self.return_bias:
-            return output
-        return output, output_bias
 
 
 def _get_column_parallel_op(
-    prefix, layer
-) -> Optional[Union[MLPColumnParallelOp, SequenceColumnParallelOp,
-                    ShardedCPColumnParallelOp, Flashcomm2OshardQKVParallelOp]]:
-    if enable_dsa_cp() and ("q_b_proj" in prefix or "kv_b_proj" in prefix):
-        return ShardedCPColumnParallelOp(layer)
+        prefix, layer
+) -> Optional[Union[MLPColumnParallelOp, SequenceColumnParallelOp]]:
     if "gate_up_proj" in prefix and mlp_tp_enable(
     ) and not is_moe_layer(prefix):
         return MLPColumnParallelOp(layer)
-    if flashcomm2_oshard_manager.flashcomm2_oshard_enable():
-        if any(p in prefix for p in ("qkv_proj", "conv1d", "query_key_value")):
-            return Flashcomm2OshardQKVParallelOp(layer)
     if enable_sp():
         if "shared_expert" in prefix:
             return None
@@ -766,9 +677,7 @@ def _get_row_parallel_op(
     prefix, layer
 ) -> Optional[Union[MLPRowParallelOp, OProjRowParallelOp,
                     Flashcomm2OProjRowParallelOp, MatmulAllreduceRowParallelOp,
-                    SequenceRowParallelOp, ShardedCPRowParallelOp]]:
-    if enable_dsa_cp() and "o_proj" in prefix:
-        return ShardedCPRowParallelOp(layer)
+                    SequenceRowParallelOp]]:
     if "down_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
@@ -801,10 +710,8 @@ def get_parallel_op(disable_tp, prefix, layer, direct):
     custom_op: Optional[Union[MLPColumnParallelOp, SequenceColumnParallelOp,
                               MLPRowParallelOp, OProjRowParallelOp,
                               Flashcomm2OProjRowParallelOp,
-                              Flashcomm2OshardQKVParallelOp,
                               MatmulAllreduceRowParallelOp,
-                              SequenceRowParallelOp, ShardedCPRowParallelOp,
-                              ShardedCPColumnParallelOp]] = None
+                              SequenceRowParallelOp]] = None
     if direct == "row":
         custom_op = _get_row_parallel_op(prefix, layer)
 
@@ -831,7 +738,7 @@ def is_moe_layer(prefix: str) -> bool:
     def get_moe_params():
         from vllm.config import get_current_vllm_config
         vllm_config = get_current_vllm_config()
-        config = vllm_config.model_config.hf_text_config
+        config = vllm_config.model_config.hf_config
         n_routed_experts = getattr(config, 'n_routed_experts', 0)
         first_k_dense_replace = getattr(config, 'first_k_dense_replace',
                                         float('inf'))

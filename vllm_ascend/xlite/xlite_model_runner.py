@@ -18,7 +18,8 @@
 # isort: skip_file
 import torch.nn as nn
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+#from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v2 import NPUModelRunner
 
 
 class XliteModelRunner(NPUModelRunner):

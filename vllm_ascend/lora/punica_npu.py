@@ -3,10 +3,21 @@
 from typing import Callable, Optional, Tuple, Union
 
 import torch
+
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+if get_ascend_device_type() == AscendDeviceType._310P:
+    from vllm.lora.ops.torch_ops import (bgmv_expand, bgmv_expand_slice,
+                                         bgmv_shrink, sgmv_expand,
+                                         sgmv_expand_slice, sgmv_shrink)
+else:
+    from vllm_ascend.lora.lora_ops import (bgmv_expand, bgmv_expand_slice,
+                                           bgmv_shrink, sgmv_expand,
+                                           sgmv_expand_slice, sgmv_shrink)
+
 from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 
 from vllm_ascend.lora.utils import refresh_all_lora_classes
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
 # The platforms that are compatible with the PyTorch-native implementation can
@@ -23,27 +34,6 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         PunicaWrapperBase.__init__(self, max_num_batched_tokens, max_batches,
                                    device)
         refresh_all_lora_classes()
-        self.lora_config = kwargs.get("lora_config")
-        if get_ascend_device_type() == AscendDeviceType._310P or (
-                self.lora_config is not None
-                and self.lora_config.max_lora_rank >= 128):
-            from vllm.lora.ops.torch_ops import (bgmv_expand,
-                                                 bgmv_expand_slice,
-                                                 bgmv_shrink, sgmv_expand,
-                                                 sgmv_expand_slice,
-                                                 sgmv_shrink)
-        else:
-            from vllm_ascend.lora.lora_ops import (bgmv_expand,
-                                                   bgmv_expand_slice,
-                                                   bgmv_shrink, sgmv_expand,
-                                                   sgmv_expand_slice,
-                                                   sgmv_shrink)
-        self.bgmv_expand = bgmv_expand
-        self.bgmv_expand_slice = bgmv_expand_slice
-        self.bgmv_shrink = bgmv_shrink
-        self.sgmv_expand = sgmv_expand
-        self.sgmv_expand_slice = sgmv_expand_slice
-        self.sgmv_shrink = sgmv_shrink
 
     def _shrink_prefill(
         self,
@@ -55,7 +45,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         #No LoRA request, so return directly
         if self.no_lora:
             return
-        self.sgmv_shrink(
+        sgmv_shrink(
             x,
             w_t_all,
             y,
@@ -70,7 +60,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         w_t_all: torch.Tensor,
         scale: float,
     ):
-        self.bgmv_shrink(x, w_t_all, y, self.token_lora_indices, scale)
+        bgmv_shrink(x, w_t_all, y, self.token_lora_indices, scale)
 
     def _expand_prefill(
         self,
@@ -82,7 +72,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         #No LoRA request, so return directly
         if self.no_lora:
             return
-        self.sgmv_expand(
+        sgmv_expand(
             x,
             w_t_all,
             y,
@@ -97,7 +87,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         w_t_all: torch.Tensor,
         add_inputs: bool,
     ):
-        self.bgmv_expand(x, w_t_all, y, self.token_lora_indices, add_inputs)
+        bgmv_expand(x, w_t_all, y, self.token_lora_indices, add_inputs)
 
     def _expand_slice_prefill(
         self,
@@ -111,7 +101,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         #No LoRA request, so return directly
         if self.no_lora:
             return
-        self.sgmv_expand_slice(
+        sgmv_expand_slice(
             x,
             w_t_all,
             y,
@@ -130,8 +120,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y_slice_size: int,
         add_inputs: bool,
     ):
-        self.bgmv_expand_slice(x, w_t_all, y, self.token_lora_indices,
-                               y_offset, y_slice_size, add_inputs)
+        bgmv_expand_slice(x, w_t_all, y, self.token_lora_indices, y_offset,
+                          y_slice_size, add_inputs)
 
     def _apply_expand(
         self,
@@ -356,7 +346,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         indices = self.sampler_indices
 
-        self.bgmv_shrink(x, lora_a_stacked, buffer, indices, scale)
-        self.bgmv_expand(buffer, lora_b_stacked, y, indices, add_inputs=True)
+        bgmv_shrink(x, lora_a_stacked, buffer, indices, scale)
+        bgmv_expand(buffer, lora_b_stacked, y, indices, add_inputs=True)
 
         y = y.view_as(y_org)

@@ -21,8 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch_npu
@@ -35,21 +34,9 @@ from vllm_ascend.ops.fused_moe.comm_utils import (
     async_all_to_all, gather_from_sequence_parallel_region)
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_device_type,
                                is_hierarchical_communication_enabled)
-
-
-@dataclass
-class TokenDispatchResult:
-    hidden_states: torch.Tensor
-    group_list: torch.Tensor
-    group_list_type: int
-    dynamic_scale: torch.Tensor | None = field(default=None)
-    topk_scales: torch.Tensor | None = field(default=None)
-    context_metadata: dict = field(default_factory=dict)
-
-
-@dataclass
-class TokenCombineResult:
-    routed_out: torch.Tensor
+from vllm_ascend.worker.ubatching import (dbo_record_current_stream,
+                                          dbo_wait_current_stream_and_yield,
+                                          UBatchEventKey)
 
 
 class MoETokenDispatcher(ABC):
@@ -81,20 +68,24 @@ class MoETokenDispatcher(ABC):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         expert_map: Optional[torch.Tensor] = None,
+        log2phy: Optional[torch.Tensor] = None,
         global_redundant_expert_num: int = 0,
+        shared_experts: Optional[Any] = None,
+        quantized_x_for_share: Optional[Any] = None,
+        dynamic_scale_for_share: Optional[Any] = None,
         mc2_mask: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         with_quant: bool = False,
         dynamic_eplb: bool = False,
         pertoken_scale: Optional[torch.Tensor] = None,
-    ) -> TokenDispatchResult:
+    ):
         raise NotImplementedError("Dispatch function not implemented.")
 
     @abstractmethod
     def token_combine(self,
                       hidden_states: torch.Tensor,
                       context_metadata: dict,
-                      bias: torch.Tensor | None = None) -> TokenCombineResult:
+                      bias: torch.Tensor = None):
         raise NotImplementedError("Combine function not implemented.")
 
 
@@ -149,14 +140,18 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         mc2_mask: torch.Tensor,
         global_redundant_expert_num: int = 0,
     ):
-        quant_mode = 2 if self.with_quant else 0
-        self.moe_expert_num = len(expert_map) + global_redundant_expert_num
+        if self.with_quant:
+            quant_mode = 2
+            moe_expert_num = len(expert_map)
+        else:
+            quant_mode = 0
+            moe_expert_num = len(expert_map)
         kwargs_mc2 = {
             "x": hidden_states,
             "expert_ids": topk_ids,
             "expert_shard_type": 0,
             "shared_expert_rank_num": 0,
-            "moe_expert_num": self.moe_expert_num,
+            "moe_expert_num": moe_expert_num,
             "global_bs": self.global_bs,
             "expert_token_nums_type": 0,
         }
@@ -188,13 +183,21 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                        topk_weights: torch.Tensor,
                        topk_ids: torch.Tensor,
                        expert_map: Optional[torch.Tensor] = None,
+                       log2phy: Optional[torch.Tensor] = None,
                        global_redundant_expert_num: int = 0,
+                       shared_experts: Optional[Any] = None,
+                       quantized_x_for_share: Optional[Any] = None,
+                       dynamic_scale_for_share: Optional[Any] = None,
                        mc2_mask: Optional[torch.Tensor] = None,
                        apply_router_weight_on_input: bool = False,
                        with_quant: bool = False,
                        dynamic_eplb: bool = False,
                        pertoken_scale: Optional[torch.Tensor] = None):
         self.with_quant = with_quant
+
+        # Apply log2phy if needed
+        if log2phy is not None:
+            topk_ids = log2phy[topk_ids]
 
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(hidden_states, topk_weights,
                                                   topk_ids, expert_map,
@@ -208,6 +211,24 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         expand_x, dynamic_scale, assist_info_for_combine, expert_token_nums, \
             ep_recv_counts, tp_recv_counts, expand_scales = output[0:7]
 
+        # Handle shared experts (store intermediate results in local vars, not self)
+        shared_act = None
+        swiglu_out_scale = None
+        if with_quant:
+            if shared_experts is not None:
+                share_up_out, _ = shared_experts.gate_up_proj(
+                    (quantized_x_for_share, dynamic_scale_for_share))
+                shared_gate_up, shared_dequant_scale = share_up_out[
+                    0], share_up_out[1]
+                shared_act_out = shared_experts.act_fn(
+                    (shared_gate_up, shared_dequant_scale))
+                shared_act, swiglu_out_scale = shared_act_out[
+                    0], shared_act_out[1]
+        else:
+            if shared_experts is not None:
+                shared_gate_up, _ = shared_experts.gate_up_proj(hidden_states)
+                shared_act = shared_experts.act_fn(shared_gate_up)
+
         context_metadata = {
             "topk_ids": topk_ids,
             "topk_weights": topk_weights,
@@ -215,15 +236,21 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "ep_recv_counts": ep_recv_counts,
             "tp_recv_counts": tp_recv_counts,
             "assist_info_for_combine": assist_info_for_combine,
+            "shared_experts": shared_experts,
+            "shared_act": shared_act,
+            "swiglu_out_scale": swiglu_out_scale,
             "expand_scales": expand_scales
         }
 
         group_list_type = 0
-        return TokenDispatchResult(hidden_states=expand_x,
-                                   dynamic_scale=dynamic_scale,
-                                   group_list=expert_token_nums,
-                                   group_list_type=group_list_type,
-                                   context_metadata=context_metadata)
+
+        return {
+            "group_list_type": group_list_type,
+            "hidden_states": expand_x,
+            "group_list": expert_token_nums,
+            "dynamic_scale": dynamic_scale,
+            "context_metadata": context_metadata
+        }
 
     def get_combine_mc_kwargs(self, hidden_states: torch.Tensor,
                               context_metadata: dict):
@@ -236,6 +263,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         expand_scales = context_metadata["expand_scales"]
 
         assert expert_map is not None
+        moe_expert_num = len(expert_map)
 
         kwargs_mc2 = {
             "expand_x": hidden_states,
@@ -243,7 +271,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "expert_scales": topk_weights.to(torch.float32),
             "expert_shard_type": 0,
             "shared_expert_rank_num": 0,
-            "moe_expert_num": self.moe_expert_num,
+            "moe_expert_num": moe_expert_num,
             "global_bs": self.global_bs,
         }
 
@@ -276,7 +304,12 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         kwargs_mc2.update(stage3_kwargs)
         return kwargs_mc2
 
-    def token_combine(self, hidden_states, context_metadata, bias=None):
+    def token_combine(
+        self,
+        hidden_states: torch.Tensor,
+        context_metadata: dict,
+        bias: torch.Tensor = None,
+    ):
         assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
 
         kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states,
@@ -284,7 +317,20 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         combined_output = torch_npu.npu_moe_distribute_combine_v2(**kwargs_mc2) \
             if self.enable_dispatch_v2 else torch_npu.npu_moe_distribute_combine(**kwargs_mc2)
 
-        return TokenCombineResult(routed_out=combined_output, )
+        # Handle shared experts from metadata
+        shared_experts = context_metadata["shared_experts"]
+        if shared_experts is None:
+            return combined_output
+
+        shared_act = context_metadata["shared_act"]
+        if self.with_quant:
+            swiglu_out_scale = context_metadata["swiglu_out_scale"]
+            shared_hidden_states, _ = shared_experts.down_proj(
+                (shared_act, swiglu_out_scale))
+        else:
+            shared_hidden_states, _ = shared_experts.down_proj(shared_act)
+
+        return combined_output, shared_hidden_states
 
 
 class TokenDispatcherWithAllGather(MoETokenDispatcher):
@@ -293,9 +339,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
         super().__init__(**kwargs)
         self.apply_router_weight_on_input = False
         self.max_num_tokens = kwargs.get("max_num_tokens")
-        num_experts_local = kwargs.get("num_local_experts", 0)
-        self.num_experts_local = num_experts_local.item() if torch.is_tensor(
-            num_experts_local) else int(num_experts_local)
+        self.num_experts_local = kwargs.get("num_local_experts", 0)
         self.original_shape = None
         self.with_quant = False
 
@@ -304,7 +348,11 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
                        topk_weights: torch.Tensor,
                        topk_ids: torch.Tensor,
                        expert_map: Optional[torch.Tensor] = None,
+                       log2phy: Optional[torch.Tensor] = None,
                        global_redundant_expert_num: int = 0,
+                       shared_experts: Optional[Any] = None,
+                       quantized_x_for_share: Optional[Any] = None,
+                       dynamic_scale_for_share: Optional[Any] = None,
                        mc2_mask: Optional[torch.Tensor] = None,
                        apply_router_weight_on_input: bool = False,
                        with_quant: bool = False,
@@ -325,7 +373,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
             hidden_states = hidden_states * \
                 topk_weights.to(hidden_states.dtype)
         if expert_map is not None:
-            global_num_experts = len(expert_map) + global_redundant_expert_num
+            global_num_experts = len(expert_map)
             mask = (expert_map[topk_ids] != -1)
             topk_weights = topk_weights * mask
             first_expert_idx = get_ep_group(
@@ -337,7 +385,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
             global_num_experts = self.num_experts_local
 
         sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
-            torch.ops._C_ascend.npu_moe_init_routing_custom(
+            torch_npu.npu_moe_init_routing_v2(
                 hidden_states,
                 topk_ids,
                 scale=pertoken_scale,
@@ -355,16 +403,18 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
             "topk_weights": topk_weights,
             "expanded_row_idx": expanded_row_idx
         }
+        return {
+            "group_list_type": group_list_type,
+            "hidden_states": sorted_hidden_states,
+            "group_list": expert_tokens,
+            "dynamic_scale": pertoken_scale if self.with_quant else None,
+            "context_metadata": context_metadata
+        }
 
-        return TokenDispatchResult(
-            hidden_states=sorted_hidden_states,
-            dynamic_scale=pertoken_scale if self.with_quant else None,
-            group_list=expert_tokens,
-            group_list_type=group_list_type,
-            context_metadata=context_metadata,
-        )
-
-    def token_combine(self, hidden_states, context_metadata, bias=None):
+    def token_combine(self,
+                      hidden_states: torch.Tensor,
+                      context_metadata: dict,
+                      bias: torch.Tensor = None):
         assert self.original_shape is not None
         final_hidden_states = torch_npu.npu_moe_token_unpermute(
             permuted_tokens=hidden_states,
@@ -374,7 +424,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
             final_hidden_states = final_hidden_states.view(self.original_shape)
 
         # these values are no longer used, so they need to be set to None for memory release.
-        return TokenCombineResult(routed_out=final_hidden_states)
+        return final_hidden_states
 
 
 class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
@@ -423,7 +473,11 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
                        topk_weights: torch.Tensor,
                        topk_ids: torch.Tensor,
                        expert_map: Optional[torch.Tensor] = None,
+                       log2phy: Optional[torch.Tensor] = None,
                        global_redundant_expert_num: int = 0,
+                       shared_experts: Optional[Any] = None,
+                       quantized_x_for_share: Optional[Any] = None,
+                       dynamic_scale_for_share: Optional[Any] = None,
                        mc2_mask: Optional[torch.Tensor] = None,
                        apply_router_weight_on_input: bool = False,
                        with_quant: bool = False,
@@ -431,6 +485,9 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
                        pertoken_scale: Optional[torch.Tensor] = None):
         self.with_quant = with_quant
         self.hidden_shape = hidden_states.shape
+
+        if log2phy is not None:
+            topk_ids = log2phy[topk_ids]
 
         (
             permutated_local_input_tokens,
@@ -443,7 +500,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         ) = self._dispatch_preprocess(hidden_states, topk_ids)
 
         forward_context = get_forward_context()
-        if forward_context.dbo_enabled:
+        if forward_context.dbo_enabled():
             forward_context.dbo_template.dbo_moe_prepare_hook(is_record=True)
         dynamic_scale_after_all2all = None
         if self.with_quant:
@@ -460,7 +517,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         permute1_ep_all_to_all_handle.wait()
 
         permutated_local_input_tokens.untyped_storage().resize_(0)
-        if forward_context.dbo_enabled:
+        if forward_context.dbo_enabled():
             forward_context.dbo_template.dbo_moe_prepare_hook(is_record=False)
         # Postprocess
         global_input_tokens, dynamic_scale_final, reversed_global_input_permutation_mapping = self._dispatch_postprocess(
@@ -480,15 +537,20 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
             reversed_global_input_permutation_mapping
         }
 
-        return TokenDispatchResult(
-            hidden_states=global_input_tokens,
-            dynamic_scale=dynamic_scale_final,
-            group_list=tokens_per_expert,
-            group_list_type=1,
-            context_metadata=context_metadata,
-        )
+        return {
+            "hidden_states": global_input_tokens,
+            "group_list": tokens_per_expert,
+            "group_list_type": 1,
+            "dynamic_scale": dynamic_scale_final,
+            "context_metadata": context_metadata,
+        }
 
-    def token_combine(self, hidden_states, context_metadata, bias=None):
+    def token_combine(
+        self,
+        hidden_states: torch.Tensor,
+        context_metadata: dict,
+        bias: torch.Tensor = None,
+    ):
         assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
 
         # 1. Preprocess using metadata
@@ -498,7 +560,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         # 2. AllToAll
 
         forward_context = get_forward_context()
-        if forward_context.dbo_enabled:
+        if forward_context.dbo_enabled():
             forward_context.dbo_template.dbo_moe_finalize_hook(is_record=True)
 
         _, permutated_local_input_tokens, handle = async_all_to_all(
@@ -509,7 +571,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         )
         handle.wait()
 
-        if forward_context.dbo_enabled:
+        if forward_context.dbo_enabled():
             forward_context.dbo_template.dbo_moe_finalize_hook(is_record=False)
         hidden_states.untyped_storage().resize_(0)
 
@@ -517,7 +579,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         output = self._combine_postprocess(permutated_local_input_tokens,
                                            context_metadata)
 
-        return TokenCombineResult(routed_out=output)
+        return output
 
     def _dispatch_preprocess(self, hidden_states, topk_ids):
         assert self.hidden_shape is not None
@@ -578,6 +640,8 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
 
         global_input_tokens_local_experts_indices = None
 
+        dbo_wait_current_stream_and_yield(event=UBatchEventKey.ATTN_POST,
+                                          wait=False)
         if self.num_local_experts > 1:
             if num_global_tokens_per_local_expert is None:
                 raise ValueError(

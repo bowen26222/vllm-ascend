@@ -21,7 +21,7 @@ from vllm import SamplingParams
 from tests.e2e.conftest import VllmRunner
 
 
-def test_qwen3_topk() -> None:
+def test_models_topk() -> None:
     example_prompts = [
         "Hello, my name is",
     ]
@@ -32,26 +32,24 @@ def test_qwen3_topk() -> None:
 
     with VllmRunner("Qwen/Qwen3-0.6B",
                     max_model_len=8192,
-                    cudagraph_capture_sizes=[1, 2, 4, 8],
                     gpu_memory_utilization=0.7) as runner:
         runner.generate(example_prompts, sampling_params)
 
 
-def test_qwen3_prompt_logprobs() -> None:
+def test_models_prompt_logprobs() -> None:
     example_prompts = [
         "Hello, my name is",
     ]
 
     with VllmRunner("Qwen/Qwen3-0.6B",
                     max_model_len=8192,
-                    cudagraph_capture_sizes=[1, 2, 4, 8],
                     gpu_memory_utilization=0.7) as runner:
         runner.generate_greedy_logprobs(example_prompts,
                                         max_tokens=5,
                                         num_logprobs=1)
 
 
-def test_qwen3_exponential_overlap() -> None:
+def test_exponential_overlap() -> None:
     example_prompts = [
         "Hello, my name is",
     ]
@@ -62,9 +60,8 @@ def test_qwen3_exponential_overlap() -> None:
 
     with VllmRunner("Qwen/Qwen3-0.6B",
                     max_model_len=8192,
-                    cudagraph_capture_sizes=[1, 2, 4, 8],
                     gpu_memory_utilization=0.7,
                     additional_config={
-                        "enable_async_exponential": True,
+                        "enable_async_exponential": 1,
                     }) as runner:
         runner.generate(example_prompts, sampling_params)

@@ -20,20 +20,15 @@ from typing import Optional, Tuple
 
 import torch
 import torch_npu
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding, MRotaryEmbedding, RotaryEmbedding,
     YaRNScalingRotaryEmbedding)
-from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
-from vllm.triton_utils import HAS_TRITON
-
-if HAS_TRITON:
-    from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
 
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import (AscendDeviceType, enable_custom_op,
-                               get_ascend_device_type, has_rope, is_vl_model,
-                               vllm_version_is)
+                               get_ascend_device_type, has_rope, is_vl_model)
 
 # Currently, rope ops used on npu requires detached cos && sin as inputs.
 # However, RotaryEmbedding in vllm use cos_sin_cache as a whole variable.
@@ -44,82 +39,75 @@ from vllm_ascend.utils import (AscendDeviceType, enable_custom_op,
 # AscendAttentionBackendImpl for GQA models, we cannot pass cos && sin by
 # attn_metadata. This causes that rope in GQA models must pass cos && sin
 # by different approaches.
-_cos_mla: torch.Tensor = None
-_sin_mla: torch.Tensor = None
-_cos_cache: torch.Tensor = None
-_sin_cache: torch.Tensor = None
-_cos_sin_cache: torch.Tensor = None
-_cos: torch.Tensor = None
-_sin: torch.Tensor = None
-_cos_slice: torch.Tensor = None
-_sin_slice: torch.Tensor = None
+#
+# Per-slot cos/sin buffers to support parallel split execution.
+# Each parallel split thread uses a different slot_id to avoid
+# concurrent inplace writes to the same tensor.
+_NUM_COS_SIN_SLOTS = 2  # max parallel splits supported
+_cos_mla: Optional[torch.Tensor] = None
+_sin_mla: Optional[torch.Tensor] = None
+_cos_sin_cache: Optional[torch.Tensor] = None
+_cos_slots: list[Optional[torch.Tensor]] = [None] * _NUM_COS_SIN_SLOTS
+_sin_slots: list[Optional[torch.Tensor]] = [None] * _NUM_COS_SIN_SLOTS
+_cos_slice_slots: list[Optional[torch.Tensor]] = [None] * _NUM_COS_SIN_SLOTS
+_sin_slice_slots: list[Optional[torch.Tensor]] = [None] * _NUM_COS_SIN_SLOTS
 
 
 def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype,
                     device):
     global _cos_mla
     global _sin_mla
-    global _cos
-    global _sin
+    global _cos_slots
+    global _sin_slots
 
     if _cos_mla is not None or \
         _sin_mla is not None or \
-        _cos is not None or \
-        _sin is not None:
+        _cos_slots[0] is not None or \
+        _sin_slots[0] is not None:
         return
 
+    compilation_config = vllm_config.compilation_config
     model_config = vllm_config.model_config
     max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
     if model_config.use_mla:
-        rope_dim = model_config.hf_text_config.qk_rope_head_dim
-        _cos_mla = torch.ones(max_num_batched_tokens,
-                              1,
-                              1,
-                              rope_dim,
-                              dtype=dtype,
-                              device=device)
-        _sin_mla = torch.zeros(max_num_batched_tokens,
-                               1,
-                               1,
-                               rope_dim,
-                               dtype=dtype,
-                               device=device)
+        if compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+            rope_dim = model_config.hf_text_config.qk_rope_head_dim
+            _cos_mla = torch.ones(max_num_reqs * decode_token_per_req,
+                                  1,
+                                  1,
+                                  rope_dim,
+                                  dtype=dtype,
+                                  device=device)
+            _sin_mla = torch.zeros(max_num_reqs * decode_token_per_req,
+                                   1,
+                                   1,
+                                   rope_dim,
+                                   dtype=dtype,
+                                   device=device)
     elif not is_vl_model(vllm_config) and has_rope(vllm_config):
         rope_dim = model_config.get_head_size()
         # For models using partial rope like Qwen3-Next.
         if hasattr(model_config.hf_text_config, "partial_rotary_factor"):
             rope_dim = int(rope_dim *
                            model_config.hf_text_config.partial_rotary_factor)
-        _cos = torch.ones(1,
-                          max_num_batched_tokens,
-                          1,
-                          rope_dim,
-                          dtype=dtype,
-                          device=device)
-        _sin = torch.zeros(1,
-                           max_num_batched_tokens,
-                           1,
-                           rope_dim,
-                           dtype=dtype,
-                           device=device)
+        for i in range(_NUM_COS_SIN_SLOTS):
+            _cos_slots[i] = torch.ones(1,
+                              max_num_batched_tokens,
+                              1,
+                              rope_dim,
+                              dtype=dtype,
+                              device=device)
+            _sin_slots[i] = torch.zeros(1,
+                               max_num_batched_tokens,
+                               1,
+                               rope_dim,
+                               dtype=dtype,
+                               device=device)
 
 
-def get_cos_and_sin_mla(positions, use_cache=False):
-    global _cos_cache
-    global _sin_cache
-    if _cos_cache is None or _sin_cache is None:
-        return None, None
-    cos = _cos_cache[positions].unsqueeze(1).unsqueeze(2)
-    sin = _sin_cache[positions].unsqueeze(1).unsqueeze(2)
-    if not use_cache:
-        return cos, sin
-    global _cos_mla
-    global _sin_mla
-    num_tokens = positions.size(0)
-    _cos_mla[:num_tokens, ...] = cos
-    _sin_mla[:num_tokens, ...] = sin
-    return _cos_mla[:num_tokens, ...], _sin_mla[:num_tokens, ...]
+def get_cos_and_sin_mla():
+    return _cos_mla, _sin_mla
 
 
 def _record_cos_sin_cache(cos_sin_cache):
@@ -129,47 +117,28 @@ def _record_cos_sin_cache(cos_sin_cache):
     _cos_sin_cache = cos_sin_cache
 
 
-def _record_cos_and_sin_cache(cos_cache, sin_cache):
-    global _cos_cache
-    global _sin_cache
-    _cos_cache = cos_cache
-    _sin_cache = sin_cache
-
-
-def _record_cos_and_sin_cache_interleaved(cos_sin_cache):
-    global _cos_cache
-    global _sin_cache
-    if _cos_cache is not None or _sin_cache is not None:
-        return
-    hidden_dim = cos_sin_cache.shape[-1] // 2
-    cos_cache, sin_cache = cos_sin_cache.view(-1, 2, hidden_dim).repeat(
-        1, 1, 2).chunk(2, dim=1)
-    _cos_cache = cos_cache.squeeze(1)
-    _sin_cache = sin_cache.squeeze(1)
-
-
-def update_cos_sin(positions):
-    global _cos
-    global _sin
-    global _cos_slice
-    global _sin_slice
+def update_cos_sin(positions, slot_id=0):
+    global _cos_slice_slots
+    global _sin_slice_slots
 
     if _cos_sin_cache is None or \
-        _cos is None or \
-        _sin is None:
+        _cos_slots[slot_id] is None or \
+        _sin_slots[slot_id] is None:
         return
 
     num_tokens = positions.size(0)
-    _cos[:, :num_tokens] = _cos_sin_cache.index_select(0, positions).view(
-        num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[0]
-    _sin[:, :num_tokens] = _cos_sin_cache.index_select(0, positions).view(
-        num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[1]
-    _cos_slice = _cos[:, :num_tokens]
-    _sin_slice = _sin[:, :num_tokens]
+    _cos_slots[slot_id][:, :num_tokens] = _cos_sin_cache.index_select(
+        0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(
+            2, dim=-2)[0]
+    _sin_slots[slot_id][:, :num_tokens] = _cos_sin_cache.index_select(
+        0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(
+            2, dim=-2)[1]
+    _cos_slice_slots[slot_id] = _cos_slots[slot_id][:, :num_tokens]
+    _sin_slice_slots[slot_id] = _sin_slots[slot_id][:, :num_tokens]
 
 
-def get_cos_and_sin_slice():
-    return _cos_slice, _sin_slice
+def get_cos_and_sin_slice(slot_id=0):
+    return _cos_slice_slots[slot_id], _sin_slice_slots[slot_id]
 
 
 def _custom_rotary_embedding_enabled(query, neox_style, head_size):
@@ -207,10 +176,11 @@ def _rope_forward_oot(
         raise NotImplementedError(
             "Batched rotary embedding is currently not supported on NPU.")
     else:
-        cos, sin = get_cos_and_sin_slice()
+        forward_context = get_forward_context()
+        slot_id = forward_context.cos_sin_slot_id
+        cos, sin = get_cos_and_sin_slice(slot_id=slot_id)
         if is_neox_style and self.head_size == 128 and self.cos_sin_cache.shape[
                 -1] == 128 and cos is not None and sin is not None:
-            forward_context = get_forward_context()
             # If cos and sin are generated outside, use npu_apply_rotary_pos_emb to avoid redundant calculation.
             # This method requires head_size and rotary_dim equal 128 and neox_style is True
             query = query.contiguous().view(1, query.shape[0], -1,
@@ -278,7 +248,6 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         super().__init__(head_size, rotary_dim, max_position_embeddings, base,
                          is_neox_style, dtype)
         _record_cos_sin_cache(self.cos_sin_cache)
-        _record_cos_and_sin_cache_interleaved(self.cos_sin_cache)
 
     def forward_oot(
         self,
@@ -513,8 +482,6 @@ class AscendDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         self.register_buffer("cos_sin_cache", cache, persistent=False)
         self.register_buffer("cos_cached", cos_cached, persistent=False)
         self.register_buffer("sin_cached", sin_cached, persistent=False)
-        _record_cos_sin_cache(cache)
-        _record_cos_and_sin_cache(cos_cached, sin_cached)
 
     def forward(self,
                 positions: torch.Tensor,
@@ -541,50 +508,12 @@ class AscendDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
 
 class AscendMRotaryEmbedding(MRotaryEmbedding):
 
-    def forward_triton(self,
-                       positions: torch.Tensor,
-                       query: torch.Tensor,
-                       key: torch.Tensor | None = None,
-                       offsets: torch.Tensor | None = None):
-        assert positions.ndim == 2
-        assert key is not None
-
-        self._match_cos_sin_cache_dtype(query)
-        self.cos = None
-        self.sin = None
-        if self.cos is None and self.sin is None:
-            cos_sin = self.cos_sin_cache[positions]  # type: ignore
-            cos, sin = cos_sin.chunk(2, dim=-1)
-            self.cos = cos.contiguous()
-            self.sin = sin.contiguous()
-        query_shape = query.shape
-        key_shape = key.shape
-
-        assert self.mrope_section
-
-        q, k = triton_mrope(
-            query,
-            key,
-            self.cos,
-            self.sin,
-            self.mrope_section,
-            self.head_size,
-            self.rotary_dim,
-            self.mrope_interleaved,
-        )
-
-        return q.reshape(query_shape), k.reshape(key_shape)
-
     def forward_oot(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
     ):
-        if HAS_TRITON and positions.ndim == 2:
-            # todo: need cann update in 8.5.0
-            return self.forward_triton(positions, query, key)
-
         if self.mrope_section != [16, 24, 24] or \
             get_ascend_device_type() == AscendDeviceType.A5:
             return super().forward_oot(positions, query, key)
@@ -610,57 +539,3 @@ class AscendMRotaryEmbedding(MRotaryEmbedding):
                                          rotary_mode='half')
 
         return query, key
-
-
-class AscendApplyRotaryEmb(ApplyRotaryEmb):
-
-    def __init__(
-        self,
-        enforce_enable: bool = False,
-        is_neox_style: bool = True,
-        enable_fp32_compute: bool = False,
-    ) -> None:
-        super().__init__(
-            enforce_enable=enforce_enable,
-            is_neox_style=is_neox_style,
-            enable_fp32_compute=enable_fp32_compute,
-        )
-
-    def forward_oot(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        if vllm_version_is('0.13.0'):
-            origin_shape = x.shape
-            origin_dtype = x.dtype
-            if len(origin_shape) == 3:
-                x = x.unsqueeze(0)
-            if self.enable_fp32_compute:
-                x = x.float()
-                cos = cos.float()
-                sin = sin.float()
-        else:
-            x, cos, sin, origin_shape, origin_dtype = self._pre_process(
-                x, cos, sin)
-
-        head_dim = x.shape[-1]
-        # cos, sin: [seq_len, head_dim // 2]
-        cos = torch.cat((cos, cos), dim=-1)
-        sin = torch.cat((sin, sin), dim=-1)
-        # cos, sin: [1, seq_len, 1, head_dim]
-        cos = cos.reshape(1, -1, 1, head_dim)
-        sin = sin.reshape(1, -1, 1, head_dim)
-
-        output = torch_npu.npu_rotary_mul(x, cos, sin)
-
-        if vllm_version_is('0.13.0'):
-            if len(origin_shape) == 3:
-                output = output.squeeze(0)
-            if self.enable_fp32_compute:
-                output = output.to(origin_dtype)
-        else:
-            output = self._post_process(output, origin_shape, origin_dtype)
-
-        return output

@@ -33,7 +33,8 @@ DTYPE = "half"
 def model_name(request):
     yield snapshot_download(request.param)
 
-def test_cross_encoder_score_1_to_1(model_name):
+
+def test_cross_encoder_1_to_1(model_name):
     text_pair = [TEXTS_1[0], TEXTS_2[0]]
 
     with HfRunner(model_name, dtype=DTYPE, is_cross_encoder=True) as hf_model:
@@ -52,7 +53,7 @@ def test_cross_encoder_score_1_to_1(model_name):
     assert hf_outputs[0] == pytest.approx(vllm_outputs[0], rel=0.01)
 
 
-def test_cross_encoder_score_1_to_N(model_name):
+def test_cross_encoder_1_to_N(model_name):
     text_pairs = [
         [TEXTS_1[0], TEXTS_2[0]],
         [TEXTS_1[0], TEXTS_2[1]],
@@ -75,7 +76,7 @@ def test_cross_encoder_score_1_to_N(model_name):
     assert hf_outputs[1] == pytest.approx(vllm_outputs[1], rel=0.01)
 
 
-def test_cross_encoder_score_N_to_N(model_name):
+def test_cross_encoder_N_to_N(model_name):
     text_pairs = [
         [TEXTS_1[0], TEXTS_2[0]],
         [TEXTS_1[1], TEXTS_2[1]],
@@ -103,7 +104,7 @@ def emb_model_name(request):
     yield snapshot_download(request.param)
 
 
-def test_embedding_score_1_to_1(emb_model_name):
+def test_embedding_1_to_1(emb_model_name):
     text_pair = [TEXTS_1[0], TEXTS_2[0]]
 
     with HfRunner(emb_model_name, dtype=DTYPE,
@@ -126,7 +127,7 @@ def test_embedding_score_1_to_1(emb_model_name):
     assert hf_outputs[0] == pytest.approx(vllm_outputs[0], rel=0.01)
 
 
-def test_embedding_score_1_to_N(emb_model_name):
+def test_embedding_1_to_N(emb_model_name):
     text_pairs = [
         [TEXTS_1[0], TEXTS_2[0]],
         [TEXTS_1[0], TEXTS_2[1]],
@@ -156,7 +157,7 @@ def test_embedding_score_1_to_N(emb_model_name):
     assert hf_outputs[1] == pytest.approx(vllm_outputs[1], rel=0.01)
 
 
-def test_embedding_score_N_to_N(emb_model_name):
+def test_embedding_N_to_N(emb_model_name):
     text_pairs = [
         [TEXTS_1[0], TEXTS_2[0]],
         [TEXTS_1[1], TEXTS_2[1]],

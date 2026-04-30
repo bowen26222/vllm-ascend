@@ -19,10 +19,10 @@ extern "C" {
 __attribute__((visibility("default"))) aclnnStatus aclnnDispatchGmmCombineDecodeGetWorkspaceSize(
     const aclTensor *x,
     const aclTensor *expertIds,
-    const aclTensorList *gmm1PermutedWeight,
-    const aclTensorList *gmm1PermutedWeightScale,
-    const aclTensorList *gmm2Weight,
-    const aclTensorList *gmm2WeightScale,
+    const aclTensor *gmm1PermutedWeight,
+    const aclTensor *gmm1PermutedWeightScale,
+    const aclTensor *gmm2Weight,
+    const aclTensor *gmm2WeightScale,
     const aclTensor *expertScales,
     const aclTensor *expertSmoothScalesOptional,
     const aclTensor *xActiveMaskOptional,
@@ -35,7 +35,7 @@ __attribute__((visibility("default"))) aclnnStatus aclnnDispatchGmmCombineDecode
     int64_t quantMode,
     int64_t globalBs,
     const aclTensor *output,
-    const aclTensor *expertTokenNums,
+    const aclTensor *epRecvCount,
     uint64_t *workspaceSize,
     aclOpExecutor **executor);
 

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 from vllm.model_executor.layers.linear import LinearBase
@@ -6,26 +7,26 @@ from vllm.model_executor.layers.linear import LinearBase
 
 @dataclass
 class FlashCommon3Context:
-    gate: LinearBase | None = None
-    topk_weights: torch.Tensor | None = None
-    topk_ids: torch.Tensor | None = None
-    row_idx: torch.Tensor | None = None
-    shared_experts: torch.nn.Module | None = None
-    shared_out: torch.Tensor | None = None
+    gate: Optional[LinearBase] = None
+    topk_weights: Optional[torch.Tensor] = None
+    topk_ids: Optional[torch.Tensor] = None
+    row_idx: Optional[torch.Tensor] = None
+    shared_experts: Optional[torch.nn.Module] = None
+    shared_out: Optional[torch.Tensor] = None
 
 
-_flash_common3_context: FlashCommon3Context | None = None
+_flash_common3_context: Optional[FlashCommon3Context] = None
 
 
-def get_flash_common3_context() -> FlashCommon3Context | None:
+def get_flash_common3_context() -> Optional[FlashCommon3Context]:
     return _flash_common3_context
 
 
 def set_flash_common3_context(
-    topk_weights: torch.Tensor | None = None,
-    topk_ids: torch.Tensor | None = None,
-    shared_experts: torch.nn.Module | None = None,
-    shared_out: torch.Tensor | None = None,
+    topk_weights: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    shared_experts: Optional[torch.nn.Module] = None,
+    shared_out: Optional[torch.Tensor] = None,
 ):
     global _flash_common3_context
     if _flash_common3_context is None:

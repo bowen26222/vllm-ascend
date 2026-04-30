@@ -22,9 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch_npu
-from vllm.distributed import (tensor_model_parallel_all_gather,
-                              tensor_model_parallel_all_reduce,
-                              tensor_model_parallel_reduce_scatter)
+from vllm.distributed import tensor_model_parallel_all_reduce, tensor_model_parallel_all_gather, tensor_model_parallel_reduce_scatter
 from vllm.distributed.parallel_state import (
     get_dp_group, get_ep_group, get_pcp_group, get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size)
@@ -35,6 +33,9 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
 from vllm_ascend.utils import (enable_sp, npu_stream_switch,
                                prefill_context_parallel_enable)
+from vllm_ascend.worker.ubatching import (dbo_record_current_stream,
+                                          dbo_wait_current_stream_and_yield,
+                                          UBatchEventKey)
 
 
 class QuantType(Enum):
@@ -154,8 +155,8 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
         """
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
+        split_hidden_states = None
 
-        padded_hidden_states_shape = hidden_states.shape
         if not (self.replace_allreduce or self.enable_shared_expert_dp):
             self.num_tokens, _ = hidden_states.shape
             pad_size = self.tp_size - self.num_tokens  # Pad to TP size (cyclic)
@@ -165,7 +166,6 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
                                                   (0, 0, 0, pad_size))
                 router_logits = nn.functional.pad(router_logits,
                                                   (0, 0, 0, pad_size))
-                padded_hidden_states_shape = hidden_states.shape
 
             if self.tp_size > 1:
                 split_hidden_states = torch.tensor_split(hidden_states,
@@ -178,9 +178,7 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
                 hidden_states = split_hidden_states[self.tp_rank]
                 router_logits = split_router_logits[self.tp_rank]
 
-        context_metadata = {
-            "padded_hidden_states_shape": padded_hidden_states_shape
-        }
+        context_metadata = {"split_hidden_states": split_hidden_states}
 
         return hidden_states, router_logits, None, context_metadata
 
@@ -196,25 +194,14 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
 
         Skips if `enable_shared_expert_dp` or `replace_allreduce` is True.
         """
+        assert context_metadata is not None
 
+        split_hidden_states = context_metadata["split_hidden_states"]
         if not (self.enable_shared_expert_dp or self.replace_allreduce):
             if self.tp_size > 1:
-                assert context_metadata is not None
-                # Cannot reuse `split_hidden_states` from prepare phase as it
-                # may share memory with original hidden_states. Since shared
-                # experts may use the original tensor, reusing it would cause
-                # in-place modification during all_gather, corrupting the data.
-                padded_hidden_states_shape = context_metadata[
-                    "padded_hidden_states_shape"]
-                gathered_hidden_states = torch.empty(
-                    padded_hidden_states_shape,
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype)
-                split_hidden_states = torch.tensor_split(
-                    gathered_hidden_states, self.tp_size, dim=0)
                 dist.all_gather(list(split_hidden_states), hidden_states,
                                 self.moe_config.tp_group.device_group)
-                hidden_states = gathered_hidden_states
+                hidden_states = torch.cat(split_hidden_states, dim=0)
 
             if self.num_tokens < hidden_states.shape[0]:
                 hidden_states = hidden_states[:self.num_tokens]
@@ -266,6 +253,7 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         """
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
+        split_hidden_states = None
         forward_context = get_forward_context()
         mc2_mask = forward_context.mc2_mask
         if self.tp_size > 1:
@@ -273,7 +261,6 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
             split_mc2_mask = torch.tensor_split(mc2_mask, self.tp_size, dim=0)
             mc2_mask = split_mc2_mask[self.tp_rank]
 
-        padded_hidden_states_shape = hidden_states.shape
         if not self.replace_allreduce:
             self.num_tokens, _ = hidden_states.shape
             target_pad_length = forward_context.padded_num_tokens
@@ -285,7 +272,6 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
                                                   (0, 0, 0, pad_size))
                 router_logits = nn.functional.pad(router_logits,
                                                   (0, 0, 0, pad_size))
-                padded_hidden_states_shape = hidden_states.shape
 
             # Slice across TP ranks
             if self.tp_size > 1 and not self.enable_shared_expert_dp:
@@ -298,9 +284,7 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
                 hidden_states = split_hidden_states[self.tp_rank]
                 router_logits = split_router_logits[self.tp_rank]
 
-        context_metadata = {
-            "padded_hidden_states_shape": padded_hidden_states_shape,
-        }
+        context_metadata = {"split_hidden_states": split_hidden_states}
 
         return hidden_states, router_logits, mc2_mask, context_metadata
 
@@ -375,6 +359,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     pertoken_scale, True, True)
         else:
+
             forward_context = get_forward_context()
             if forward_context.dbo_enabled:
                 forward_context.dbo_template.dbo_moe_prepare_hook(
@@ -546,4 +531,8 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         if prefill_context_parallel_enable() and self.moe_config.pcp_size > 1:
             hidden_states = get_pcp_group().reduce_scatter(hidden_states,
                                                            dim=0)
+        if reduce_results and (self.moe_config.tp_size > 1
+                               or self.moe_config.ep_size > 1):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+
         return hidden_states

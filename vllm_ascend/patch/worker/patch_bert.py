@@ -20,6 +20,7 @@ from vllm.model_executor.models import bert
 
 # aclgraph does not support shift operator for now
 # TODO: revert me when aclgraph supports shift operator
+TOKEN_TYPE_SHIFT = 30
 TOKEN_TYPE_MULTIPLIER = 1 << 30
 TOKEN_MASK = TOKEN_TYPE_MULTIPLIER - 1
 

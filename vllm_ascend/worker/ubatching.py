@@ -1,21 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
-from enum import Enum
 from typing import Optional
+from enum import Enum
 
 import torch
+
 from vllm import forward_context
 from vllm.forward_context import ForwardContext
 from vllm.v1.worker.ubatching import UBatchContext
-
 from vllm_ascend import envs
 from vllm_ascend.utils import dbo_current_stream, dbo_set_stream
 
 _THREAD_ID_TO_CONTEXT: dict = {}
-# Here we hardcode the number of microbatches to 2 for default.
-_NUM_UBATCHES: int = 2
-_CURRENT_CONTEXTS: list[Optional["UBatchContext"]] = []
+_CURRENT_CONTEXTS: list[Optional['AscendUBatchContext']] = [None, None]
 
 
 class UBatchEventKey(Enum):
@@ -68,12 +66,12 @@ class AscendUBatchContext(UBatchContext):
         global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
         _THREAD_ID_TO_CONTEXT[threading.get_ident()] = self.id
         _CURRENT_CONTEXTS[self.id] = self
-        # _NUM_UBATCHES is set in make_ubatch_contexts
         self.ready_barrier.wait()
 
         self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
         self._restore_context()
+        forward_context._forward_context.dbo_enabled = True
         # Assume we want to start on the compute stream
         self.update_stream(self.compute_stream)
         return self
@@ -86,6 +84,9 @@ class AscendUBatchContext(UBatchContext):
         self.cpu_signal_event.set()
         self.cpu_wait_event.clear()
         return False
+
+    def _restore_context(self):
+        forward_context._forward_context = self.forward_context
 
     def update_stream(self, stream):
         self.current_stream = stream
@@ -117,6 +118,12 @@ class AscendUBatchContext(UBatchContext):
         self.cpu_wait_event.clear()
         self._restore_context()
 
+    def switch_to_comm(self):
+        self.update_stream(self.comm_stream)
+
+    def switch_to_compute(self):
+        self.update_stream(self.compute_stream)
+
     def switch_to_comm_sync(self, event=UBatchEventKey.DEFAULT):
         self._signal_compute_done(event)
         self.update_stream(self.comm_stream)
@@ -147,6 +154,11 @@ class AscendUBatchContext(UBatchContext):
                                        cube_num=self.comp_cube_core,
                                        vector_num=self.comp_vector_core)
 
+    def maybe_run_recv_hook(self):
+        if self.recv_hook is not None:
+            self.recv_hook()
+            self.recv_hook = None
+
     def yield_(self):
         self.current_stream = dbo_current_stream()
         self._cpu_yield()
@@ -171,6 +183,16 @@ class AscendUBatchContext(UBatchContext):
         assert self.current_stream == self.comm_stream
         self.update_stream(self.compute_stream)
         self._wait_comm_done(event)
+
+
+def dbo_enabled() -> bool:
+    return len(_THREAD_ID_TO_CONTEXT) > 0
+
+
+def dbo_current_ubatch_id() -> int:
+    if len(_THREAD_ID_TO_CONTEXT) == 0:
+        return 0
+    return _THREAD_ID_TO_CONTEXT[threading.get_ident()]
 
 
 def _register_ubatch_function(func):
@@ -206,6 +228,13 @@ dbo_wait_current_stream_and_yield = _register_ubatch_function(
     AscendUBatchContext.wait_current_stream_and_yield)
 
 
+def dbo_register_recv_hook(recv_hook):
+    if len(_THREAD_ID_TO_CONTEXT) > 0:
+        ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
+        next_ctx = _CURRENT_CONTEXTS[(ctx_idx + 1) % 2]
+        next_ctx.recv_hook = recv_hook
+
+
 def dbo_get_previous_event(func, *args, **kwargs):
     if len(_THREAD_ID_TO_CONTEXT) > 0:
         ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
@@ -223,14 +252,7 @@ def make_ubatch_contexts(
     ready_barrier: threading.Barrier,
     schedule: str = "default",
 ) -> list[AscendUBatchContext]:
-    global _NUM_UBATCHES, _CURRENT_CONTEXTS
-    assert num_micro_batches > 1, "num_micro_batches must be greater than 1"
-
-    _NUM_UBATCHES = num_micro_batches
-    # Ensure the global context list is large enough
-    if len(_CURRENT_CONTEXTS) < num_micro_batches:
-        _CURRENT_CONTEXTS.extend([None] *
-                                 (num_micro_batches - len(_CURRENT_CONTEXTS)))
+    assert num_micro_batches == 2, "only been tested with 2 micro-batches"
     """
     Create a context manager for micro-batching synchronization.
     """
@@ -248,6 +270,8 @@ def make_ubatch_contexts(
         key: torch.npu.Event()
         for key in key_list
     } for _ in range(num_micro_batches)]
+
+    assert len(forward_contexts) == 2
 
     ctxs = []
     current_microbatch_stream = compute_stream

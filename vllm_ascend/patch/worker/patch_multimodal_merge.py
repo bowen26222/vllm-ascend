@@ -37,9 +37,8 @@ def _merge_multimodal_embeddings(
         This updates ``inputs_embeds`` in place.
     """
     flattened = _flatten_embeddings(multimodal_embeddings)
-    input_dtype = inputs_embeds.dtype
     try:
-        inputs_embeds[is_multimodal] = flattened.to(dtype=input_dtype)
+        inputs_embeds[is_multimodal] = flattened
     except RuntimeError as e:
         num_expected_tokens = is_multimodal.sum().item()
         assert isinstance(num_expected_tokens, int)

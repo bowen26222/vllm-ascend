@@ -1,4 +1,5 @@
 class UbatchOverlapBaseTemplate:
+
     # Custom hooks for dbo overlap policy
     # Users can control the following aspects by implementing these hooks:
     # (1) kernel launching orders along two streams
