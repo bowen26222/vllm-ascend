@@ -1057,8 +1057,10 @@ class AscendMlaCPImpl(AscendMLAImpl):
             "return_lse": True,
             "calc_type": "calc_type_ring",
         }
-        graph_params = get_graph_params()
         forward_context: ForwardContext = get_forward_context()
+        in_parallel_streams = bool(
+            getattr(forward_context, "in_parallel_streams", False))
+        graph_params = get_graph_params(in_parallel_streams)
         if forward_context.capturing:
             stream = torch_npu.npu.current_stream()
             event = torch.npu.ExternalEvent()
@@ -1071,7 +1073,8 @@ class AscendMlaCPImpl(AscendMLAImpl):
                     q_nope, q_pe, k_nope, k_pe, decode_meta.block_table,
                     seq_len, num_heads, self.scale, self.num_kv_heads,
                     **common_kwargs)
-                update_graph_params_workspaces(num_tokens, workspace)
+                update_graph_params_workspaces(num_tokens, workspace,
+                                              in_parallel_streams=in_parallel_streams)
             attn_output = torch.empty_like(q_nope)
             softmax_lse = torch.empty((num_tokens, num_heads, 1),
                                       dtype=q_nope.dtype,

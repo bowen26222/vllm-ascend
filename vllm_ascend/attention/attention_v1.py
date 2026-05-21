@@ -371,7 +371,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             = self._get_fia_params(key, value, attn_metadata)
 
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
-        graph_params = get_graph_params()
+        in_parallel_streams = bool(
+            getattr(get_forward_context(), "in_parallel_streams", False))
+        graph_params = get_graph_params(in_parallel_streams)
         actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
         # Prepare tensors for attention output
         # TODO: Refactor this to step-level instead of layer-level
@@ -395,7 +397,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 sparse_mode=3,
                 scale=self.scale,
             )
-            update_graph_params_workspaces(num_tokens, workspace)
+            update_graph_params_workspaces(num_tokens,
+                                           workspace,
+                                           in_parallel_streams=in_parallel_streams)
 
         # Handle graph capturing mode
         stream = torch_npu.npu.current_stream()
@@ -443,10 +447,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: Optional[torch.Tensor] = None,
     ):
-        graph_params = get_graph_params()
         forward_context: ForwardContext = get_forward_context()
+        in_parallel_streams = bool(
+            getattr(forward_context, "in_parallel_streams", False))
+        graph_params = get_graph_params(in_parallel_streams)
         num_tokens = query.shape[0]
         if getattr(forward_context, "capturing", False):
+            import sys
+            _cap_key = f"_cap_cnt_{'par' if in_parallel_streams else 'main'}_{num_tokens}"
+            _cap_cnt = getattr(AscendAttentionBackendImpl, _cap_key, 0)
+            if _cap_cnt < 2:
+                setattr(AscendAttentionBackendImpl, _cap_key, _cap_cnt + 1)
+                print(f"[DBG full_graph_pa CAPTURE] in_parallel={in_parallel_streams} num_tokens={num_tokens} "
+                      f"seq_lens={attn_metadata.seq_lens.tolist() if attn_metadata.seq_lens is not None else None} "
+                      f"block_tables_ptr={attn_metadata.block_tables.data_ptr() if attn_metadata.block_tables is not None else None} "
+                      f"block_tables_shape={list(attn_metadata.block_tables.shape) if attn_metadata.block_tables is not None else None}",
+                      flush=True, file=sys.stderr)
             # Get workspace from cache or calculate it if not present.
             workspace = graph_params.workspaces.get(num_tokens)
             if workspace is None:
@@ -461,7 +477,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     context_lens=attn_metadata.seq_lens,
                     out=output)
                 update_graph_params_workspaces(num_tokens,
-                                               weak_ref_tensors(workspace))
+                                               weak_ref_tensors(workspace),
+                                               in_parallel_streams=in_parallel_streams)
 
             # Handle graph capturing mode
             stream = torch_npu.npu.current_stream()

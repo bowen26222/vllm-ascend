@@ -530,10 +530,19 @@ class ACLGraphWrapper:
 
 
 def _update_attn_pa_params(update_stream, forward_context, runtime_shape,
-                           refresh_block_table: bool = False):
-    graph_params = get_graph_params()
+                           refresh_block_table: bool = False,
+                           in_parallel_streams: bool = False):
+    graph_params = get_graph_params(in_parallel_streams)
     # FIXME: Behold! We are using a temporary hack here to update the args
     # for each layer's attention op in the graph.
+    _DBG_FIRST = getattr(_update_attn_pa_params, '_dbg_count', 0) < 4
+    if _DBG_FIRST:
+        _update_attn_pa_params._dbg_count = getattr(_update_attn_pa_params, '_dbg_count', 0) + 1
+        import sys
+        print(f"[DBG _update_attn_pa_params] in_parallel={in_parallel_streams} shape={runtime_shape} "
+              f"attn_meta_type={type(forward_context.attn_metadata).__name__} "
+              f"attn_meta_len={len(forward_context.attn_metadata) if hasattr(forward_context.attn_metadata,'__len__') else 'N/A'} "
+              f"graph_params_attn_len={len(graph_params.attn_params.get(runtime_shape,[]))}", flush=True, file=sys.stderr)
     with torch.npu.stream(update_stream):
         for key, param, handle, event in zip(
                 forward_context.attn_metadata,
@@ -553,6 +562,14 @@ def _update_attn_pa_params(update_stream, forward_context, runtime_shape,
                 output,
             ) = param
             seq_lens = forward_context.attn_metadata[key].seq_lens
+
+            if _DBG_FIRST:
+                import sys
+                print(f"[DBG _update_attn_pa_params] key={key} in_parallel={in_parallel_streams} "
+                      f"seq_lens={seq_lens.tolist() if seq_lens is not None else None} "
+                      f"graph_block_table_ptr={block_table.data_ptr() if isinstance(block_table, __import__('torch').Tensor) else None} "
+                      f"graph_block_table_shape={list(block_table.shape) if isinstance(block_table, __import__('torch').Tensor) else None}",
+                      flush=True, file=sys.stderr)
 
             metadata = forward_context.attn_metadata[key]
             metadata_block_table, metadata_block_source = _extract_block_table_from_metadata(
@@ -615,8 +632,9 @@ def _update_attn_pa_params(update_stream, forward_context, runtime_shape,
 
 
 def _update_attn_fia_params(update_stream, forward_context, runtime_shape,
-                            refresh_block_table: bool = False):
-    graph_params = get_graph_params()
+                            refresh_block_table: bool = False,
+                            in_parallel_streams: bool = False):
+    graph_params = get_graph_params(in_parallel_streams)
     # For Qwen3-next, since the kv_cache_config has already categorized
     # linear_attn and self_attn, the attn_metadata is first arranged with
     # self_attn followed by linear_attn. Therefore, using zip directly
@@ -683,15 +701,18 @@ def _update_attn_fia_params(update_stream, forward_context, runtime_shape,
 
 
 def update_attn_params(update_stream, forward_context, runtime_shape,
-                       vllm_config):
+                       vllm_config, in_parallel_streams: bool = False):
     if using_paged_attention(runtime_shape, vllm_config):
-        _update_attn_pa_params(update_stream, forward_context, runtime_shape)
+        _update_attn_pa_params(update_stream, forward_context, runtime_shape,
+                               in_parallel_streams=in_parallel_streams)
     else:
-        _update_attn_fia_params(update_stream, forward_context, runtime_shape)
+        _update_attn_fia_params(update_stream, forward_context, runtime_shape,
+                                in_parallel_streams=in_parallel_streams)
 
 
 def update_attn_params_split(update_stream, forward_context,
-                             runtime_shape, vllm_config):
+                             runtime_shape, vllm_config,
+                             in_parallel_streams: bool = False):
     """Split-only attn update with block_table in-place refresh enabled."""
     if using_paged_attention(runtime_shape, vllm_config):
         _update_attn_pa_params(
@@ -699,6 +720,7 @@ def update_attn_params_split(update_stream, forward_context,
             forward_context,
             runtime_shape,
             refresh_block_table=True,
+            in_parallel_streams=in_parallel_streams,
         )
     else:
         _update_attn_fia_params(
@@ -706,15 +728,17 @@ def update_attn_params_split(update_stream, forward_context,
             forward_context,
             runtime_shape,
             refresh_block_table=True,
+            in_parallel_streams=in_parallel_streams,
         )
 
 
 def update_mla_attn_params(update_stream, forward_context, runtime_shape,
-                           speculative_config):
+                           speculative_config,
+                           in_parallel_streams: bool = False):
     if forward_context.is_mtp_model:
         graph_params = get_mtp_graph_params()
     else:
-        graph_params = get_graph_params()
+        graph_params = get_graph_params(in_parallel_streams)
     # FIXME: Behold! We are using a temporary hack here to update the args
     # for each layer's attention op in the graph.
     with torch.npu.stream(update_stream):
@@ -781,10 +805,11 @@ def update_mla_attn_params(update_stream, forward_context, runtime_shape,
             event.record(update_stream)
 
 
-def update_attn_dcp_pcp_params(update_stream, forward_context, runtime_shape):
+def update_attn_dcp_pcp_params(update_stream, forward_context, runtime_shape,
+                               in_parallel_streams: bool = False):
     # FIXME: Behold! We are using a temporary hack here to update the args
     # for each layer's attention op in the graph.
-    graph_params = get_graph_params()
+    graph_params = get_graph_params(in_parallel_streams)
     with torch.npu.stream(update_stream):
         for key, param, handle, event in zip(
                 forward_context.attn_metadata,
@@ -844,8 +869,9 @@ def update_attn_dcp_pcp_params(update_stream, forward_context, runtime_shape):
 
 
 def update_mla_attn_dcp_pcp_params(update_stream, forward_context,
-                                   runtime_shape):
-    graph_params = get_graph_params()
+                                   runtime_shape,
+                                   in_parallel_streams: bool = False):
+    graph_params = get_graph_params(in_parallel_streams)
     # FIXME: Behold! We are using a temporary hack here to update the args
     # for each layer's attention op in the graph.
     with torch.npu.stream(update_stream):
@@ -901,31 +927,56 @@ class GraphParams:
 
 
 _graph_params: Optional[GraphParams] = None
+_graph_params_parallel: Optional[GraphParams] = None
+
+
+def _make_graph_params(aclgraph_capture_sizes: list[int]) -> GraphParams:
+    return GraphParams(
+        {size: [] for size in aclgraph_capture_sizes},
+        {size: None for size in aclgraph_capture_sizes},
+        {size: [] for size in aclgraph_capture_sizes},
+        {size: [] for size in aclgraph_capture_sizes},
+    )
 
 
 def set_graph_params(aclgraph_capture_sizes: list[int]):
     global _graph_params
     if _graph_params is not None:
         raise ValueError("Graph parameters have already been set!")
-    _graph_params = GraphParams(
-        {size: []
-         for size in aclgraph_capture_sizes},
-        {size: None
-         for size in aclgraph_capture_sizes},
-        {size: []
-         for size in aclgraph_capture_sizes},
-        {size: []
-         for size in aclgraph_capture_sizes},
-    )
+    _graph_params = _make_graph_params(aclgraph_capture_sizes)
 
 
-def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
-    global _graph_params
-    if _graph_params is not None:
-        _graph_params.workspaces[num_tokens] = weak_ref_tensors(workspace)
+def set_graph_params_parallel(aclgraph_capture_sizes: list[int]):
+    """Initialize a separate GraphParams for the parallel stream.
+
+    The parallel stream runs concurrently with the main stream, so it needs
+    its own GraphParams to avoid races when both streams call
+    graph_task_update_begin/end at the same time.
+    """
+    global _graph_params_parallel
+    if _graph_params_parallel is not None:
+        raise ValueError("Parallel graph parameters have already been set!")
+    _graph_params_parallel = _make_graph_params(aclgraph_capture_sizes)
 
 
-def get_graph_params():
+def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor,
+                                   in_parallel_streams: bool = False):
+    global _graph_params, _graph_params_parallel
+    target = _graph_params_parallel if in_parallel_streams else _graph_params
+    if target is not None:
+        target.workspaces[num_tokens] = weak_ref_tensors(workspace)
+
+
+def get_graph_params(in_parallel_streams: bool = False) -> Optional[GraphParams]:
+    """Return the GraphParams for the given stream context.
+
+    When *in_parallel_streams* is True, return the parallel-stream params so
+    that concurrent graph_task_update calls never share the same handles/events.
+    Falls back to the main params if the parallel params have not been
+    initialised yet (e.g. during capture warm-up).
+    """
+    if in_parallel_streams and _graph_params_parallel is not None:
+        return _graph_params_parallel
     return _graph_params
 
 

@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 import torch
+import torch_npu
 
 # Match existing offline example behavior.
 os.environ.setdefault("VLLM_USE_MODELSCOPE", "True")
@@ -45,12 +46,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("ASCEND_RT_VISIBLE_DEVICES", "3")
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
 
-# IMPORTANT: In vllm-ascend/worker/worker.py, VLLM_USE_V2_MODEL_RUNNER routes to
-# vllm_ascend.worker.v2.model_runner (marked as developing). We want the default
-# NPUModelRunner in vllm_ascend/worker/model_runner_v2.py.
-os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["ACL_DEVICE_SYNC_TIMEOUT"] = "60"
 
 
 from vllm import LLM, SamplingParams  # noqa: E402
@@ -133,6 +129,26 @@ def create_parser() -> FlexibleArgumentParser:
         "--enable-parallel-streams",
         action="store_true",
         help="Enable split parallel streams (if supported).",
+    )
+    test_group.add_argument(
+        "--parallel-capture-sizes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated capture sizes for the parallel-stream graph pool "
+            "(split_batch_config.parallel_capture_sizes). "
+            "When omitted the parallel pool reuses cudagraph_capture_sizes. "
+            "Example: --parallel-capture-sizes 1,2,4,8,16,32,64,128"
+        ),
+    )
+    test_group.add_argument(
+        "--force-split",
+        action="store_true",
+        help=(
+            "Force split-batch for every decode step regardless of padding "
+            "savings (split_batch_config.force_split). Useful for benchmarking "
+            "the split path on all batch sizes including exact graph hits."
+        ),
     )
     test_group.add_argument(
         "--run",
@@ -396,13 +412,34 @@ def _run_with_torch_profiler(
     if hasattr(torch, "npu") and hasattr(torch.npu, "synchronize"):
         torch.npu.synchronize()
 
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        export_type=[
+            torch_npu.profiler.ExportType.Text
+            ],
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+        mstx=False,    # 原参数名msprof_tx改为mstx，新版本依旧兼容原参数名msprof_tx
+        mstx_domain_include=[],
+        mstx_domain_exclude=[],
+        aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        l2_cache=False,
+        op_attr=False,
+        data_simplification=False,
+        record_op_args=False,
+        gc_detect_threshold=None,
+        host_sys=[],
+        sys_io=False,
+        sys_interconnection=False
+    )
+
     with npu_profiler.profile(
         activities=activities,
         schedule=schedule,
         record_shapes=record_shapes,
         with_stack=with_stack,
+        with_modules=True,
         on_trace_ready=trace_handler,
         profile_memory=False,
+        experimental_config=experimental_config
     ) as prof:
         result = fn()
         if hasattr(torch, "npu") and hasattr(torch.npu, "synchronize"):
@@ -419,15 +456,20 @@ def _build_split_additional_config(
     num_splits: int,
     enable_parallel_streams: bool,
     min_batch_size_for_split: int,
+    parallel_capture_sizes: list[int] | None = None,
+    force_split: bool = False,
 ) -> dict[str, Any]:
-    return {
-        "split_batch_config": {
-            "enabled": enabled,
-            "num_splits": num_splits,
-            "enable_parallel_streams": enable_parallel_streams,
-            "min_batch_size_for_split": min_batch_size_for_split,
-        }
+    cfg: dict[str, Any] = {
+        "enabled": enabled,
+        "num_splits": num_splits,
+        "enable_parallel_streams": enable_parallel_streams,
+        "min_batch_size_for_split": min_batch_size_for_split,
     }
+    if parallel_capture_sizes is not None:
+        cfg["parallel_capture_sizes"] = parallel_capture_sizes
+    if force_split:
+        cfg["force_split"] = True
+    return {"split_batch_config": cfg}
 
 
 def _run_single(
@@ -641,6 +683,13 @@ def main() -> int:
     num_splits = int(args.pop("num_splits"))
     min_batch_size_for_split = int(args.pop("min_batch_size_for_split"))
     enable_parallel_streams = bool(args.pop("enable_parallel_streams"))
+    _parallel_capture_sizes_raw = args.pop("parallel_capture_sizes")
+    parallel_capture_sizes: list[int] | None = (
+        [int(s.strip()) for s in _parallel_capture_sizes_raw.split(",") if s.strip()]
+        if _parallel_capture_sizes_raw
+        else None
+    )
+    force_split = bool(args.pop("force_split"))
     run_mode = str(args.pop("run"))
     compare_mode = str(args.pop("compare_mode"))
     output_dir_base = str(args.pop("output_dir"))
@@ -691,12 +740,16 @@ def main() -> int:
         num_splits=num_splits,
         enable_parallel_streams=enable_parallel_streams,
         min_batch_size_for_split=min_batch_size_for_split,
+        parallel_capture_sizes=parallel_capture_sizes,
+        force_split=force_split,
     )
     split_enabled_cfg = _build_split_additional_config(
         enabled=True,
         num_splits=num_splits,
         enable_parallel_streams=enable_parallel_streams,
         min_batch_size_for_split=min_batch_size_for_split,
+        parallel_capture_sizes=parallel_capture_sizes,
+        force_split=force_split,
     )
 
     # Preferred: coordinator mode spawns 2 child processes then compares.

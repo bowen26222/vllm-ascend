@@ -102,6 +102,7 @@ from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
 # yapf: disable
 from vllm_ascend.compilation.acl_graph import (ACLGraphWrapper,
                                                set_graph_params,
+                                               set_graph_params_parallel,
                                                set_mtp_graph_params,
                                                update_attn_dcp_pcp_params,
                                                update_attn_params,
@@ -207,15 +208,30 @@ _SPLIT_METADATA_DEBUG_FILE = os.environ.get(
         os.path.join(os.path.dirname(__file__), "..", "split_metadata_debug.log")
     ),
 )
+
+# Perf stats log file: each decode step appends one JSON line with timing info.
+# Set VLLM_ASCEND_PERF_STATS_FILE to a path to enable; empty string disables.
+_PERF_STATS_FILE = os.environ.get(
+    "VLLM_ASCEND_PERF_STATS_FILE",
+    "",
+)
+
+def _write_perf_stats(stats: dict) -> None:
+    """Append one JSON line to the perf stats file (if enabled)."""
+    if not _PERF_STATS_FILE:
+        return
+    try:
+        import json as _json
+        with open(_PERF_STATS_FILE, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(stats, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("Failed to write perf stats to %s: %s",
+                       _PERF_STATS_FILE, e)
 # Rollback switch for split context rebuild coordinate validation.
 # - default "1": use local coordinate slices for rebuilt split context
 # - set VLLM_ASCEND_SPLIT_LOCAL_CONTEXT_REBUILD=0 to restore legacy behavior
 _SPLIT_LOCAL_CONTEXT_REBUILD = os.environ.get(
     "VLLM_ASCEND_SPLIT_LOCAL_CONTEXT_REBUILD", "1") not in ("0", "false", "False")
-_SPLIT_DUMP_MAIN_STREAM = os.environ.get(
-    "VLLM_ASCEND_SPLIT_DUMP_MAIN_STREAM", "0") not in ("0", "false", "False")
-_SPLIT_DUMP_PARALLEL_STREAM = os.environ.get(
-    "VLLM_ASCEND_SPLIT_DUMP_PARALLEL_STREAM", "0") not in ("0", "false", "False")
 
 
 def _append_split_metadata_debug(tag: str, payload: Any) -> None:
@@ -229,6 +245,48 @@ def _append_split_metadata_debug(tag: str, payload: Any) -> None:
             _SPLIT_METADATA_DEBUG_FILE,
             e,
         )
+
+
+def _clone_attn_metadata_block_tables(attn_metadata: Any) -> Any:
+    """Return a copy of attn_metadata with cloned block_tables tensors.
+
+    When capturing ACL graphs for the parallel stream, both _graph_params and
+    _graph_params_parallel would otherwise bind the *same* device block_table
+    storage (from self.input_batch.block_table).  At runtime the two concurrent
+    _refresh_block_table_in_place calls would both write to block_table[:N, :]
+    starting from row 0, causing a data race that corrupts KV-cache lookups.
+
+    Cloning gives _graph_params_parallel its own device buffer so the two
+    in-place refreshes target distinct memory regions.
+    """
+    import dataclasses
+
+    def _clone_single(meta: Any) -> Any:
+        if meta is None or not dataclasses.is_dataclass(meta):
+            return meta
+        kwargs: dict = {}
+        if getattr(meta, "block_tables", None) is not None:
+            kwargs["block_tables"] = meta.block_tables.clone()
+        # Also clone sub-metadata that carry their own block_tables.
+        for sub_field in ("prefill", "decode_meta"):
+            sub = getattr(meta, sub_field, None)
+            if sub is not None and dataclasses.is_dataclass(sub):
+                sub_kwargs: dict = {}
+                if getattr(sub, "block_tables", None) is not None:
+                    sub_kwargs["block_tables"] = sub.block_tables.clone()
+                if sub_kwargs:
+                    kwargs[sub_field] = dataclasses.replace(sub, **sub_kwargs)
+        return dataclasses.replace(meta, **kwargs) if kwargs else meta
+
+    if isinstance(attn_metadata, dict):
+        return {k: _clone_single(v) for k, v in attn_metadata.items()}
+    if isinstance(attn_metadata, list):
+        return [
+            {k: _clone_single(v) for k, v in d.items()}
+            if isinstance(d, dict) else _clone_single(d)
+            for d in attn_metadata
+        ]
+    return _clone_single(attn_metadata)
 
 
 def _safe_tensor_ptr(tensor: Any) -> Optional[int]:
@@ -559,6 +617,21 @@ class NPUModelRunner(GPUModelRunner):
         self.stream_main = torch.npu.current_stream()
         self.stream_parallel = torch.npu.Stream(device=self.device)
 
+        # Performance measurement accumulators.
+        # _perf_accum holds running totals across all decode steps so that
+        # callers can compute TPOT = total_replay_ms / total_output_tokens.
+        # _last_step_perf holds the most recent step's breakdown.
+        self._perf_accum: dict = {
+            "total_replay_ms": 0.0,
+            "total_header_ms": 0.0,
+            "total_output_tokens": 0,
+            "num_decode_steps": 0,
+        }
+        self._last_step_perf: dict = {}
+        self._t_replay_start: float = 0.0
+        self._t_replay_end: float = 0.0
+        self._t_header_start: float = 0.0
+
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -866,25 +939,117 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_capture_sizes = set(
                 self.compilation_config.cudagraph_capture_sizes or []
             ) if self.use_aclgraph else None
-            _PARALLEL_FIXED_TOKENS = 64
             custom_split_sizes = None
-            if num_reqs >= _PARALLEL_FIXED_TOKENS:
-                parallel_reqs = min(_PARALLEL_FIXED_TOKENS, num_reqs // 2)
-                main_reqs = num_reqs - parallel_reqs
-                custom_split_sizes = [main_reqs, parallel_reqs]
-            split_batch_slices, _ = split_batch_split(
-                num_scheduled_tokens,
-                num_tokens_unpadded,
-                num_tokens_padded,
-                vllm_config=self.vllm_config,
-                cudagraph_capture_sizes=cudagraph_capture_sizes,
-                custom_split_sizes=custom_split_sizes,
-            )
-            if split_batch_slices:
-                split_ubatch_slices = [
-                    UBatchSlice(s.request_slice, s.token_slice)
-                    for s in split_batch_slices
-                ]
+            _should_split = True  # whether to call split_batch_split at all
+            if cudagraph_capture_sizes and self.use_aclgraph:
+                # Find the largest main-stream graph size that fits within
+                # num_reqs without padding.  The remainder goes to the parallel
+                # stream (which may be padded to its own nearest graph size).
+                sorted_main_sizes = sorted(cudagraph_capture_sizes)
+                max_main_size = sorted_main_sizes[-1]
+
+                # Helper: ceil num to the nearest graph size in a sorted list.
+                def _ceil_to_graph(n: int, sizes: list[int]) -> int:
+                    for s in sizes:
+                        if s >= n:
+                            return s
+                    return sizes[-1]  # clamp to max if n exceeds all sizes
+
+                main_reqs = max(
+                    (s for s in sorted_main_sizes if s <= num_reqs),
+                    default=0,
+                )
+                parallel_reqs = num_reqs - main_reqs
+
+                # force_split: skip threshold check and always split as
+                # (main_reqs + parallel_reqs) whenever there is a non-trivial
+                # remainder and main_reqs hits a captured graph.
+                _split_cfg = getattr(
+                    self.ascend_config, "split_batch_config", None)
+                force_split = bool(
+                    _split_cfg is not None
+                    and getattr(_split_cfg, "force_split", False)
+                )
+
+                if main_reqs == num_reqs:
+                    if force_split and len(sorted_main_sizes) >= 2:
+                        # Force split even when num_reqs exactly hits a graph.
+                        # Use the second-largest graph size <= num_reqs as the
+                        # main slice so there is a non-zero parallel remainder.
+                        candidates = [s for s in sorted_main_sizes
+                                      if s < num_reqs]
+                        if candidates:
+                            main_reqs = max(candidates)
+                            parallel_reqs = num_reqs - main_reqs
+                            custom_split_sizes = [main_reqs, parallel_reqs]
+                        else:
+                            # num_reqs == smallest graph size; cannot split.
+                            _should_split = False
+                    else:
+                        # num_reqs exactly hits a main-stream graph: no split.
+                        # Let split_ubatch_slices stay None so the forward pass
+                        # goes through _generate_process_reqs_hidden_states.
+                        _should_split = False
+                elif main_reqs > 0 and parallel_reqs > 0:
+                    if force_split:
+                        # Force split: always use (main_reqs + parallel_reqs)
+                        # regardless of padding savings or whether num_reqs
+                        # exceeds the largest captured graph size.
+                        custom_split_sizes = [main_reqs, parallel_reqs]
+                    elif num_reqs > max_main_size:
+                        # num_reqs exceeds all captured sizes; no graph to pad
+                        # to, so no split benefit under normal threshold logic.
+                        _should_split = False
+                    else:
+                        # Evaluate whether splitting saves enough padding.
+                        #
+                        # padding_saved = padding wasted without split
+                        #               - padding the parallel slice still needs
+                        #
+                        # Without split: num_reqs pads up to the next graph.
+                        # With split:    main_reqs hits a graph (0 padding);
+                        #                parallel_reqs pads to its nearest graph.
+                        threshold = getattr(
+                            self.compilation_config,
+                            "cudagraph_split_pad_threshold",
+                            0,
+                        )
+                        # Parallel-stream capture sizes (may differ from main).
+                        parallel_sizes = sorted(
+                            getattr(
+                                self, "cudagraph_batch_sizes_parallel", None)
+                            or sorted_main_sizes
+                        )
+                        original_padded = _ceil_to_graph(
+                            num_reqs, sorted_main_sizes)
+                        original_padding = original_padded - num_reqs
+                        remainder_padded = _ceil_to_graph(
+                            parallel_reqs, parallel_sizes)
+                        remainder_padding = remainder_padded - parallel_reqs
+                        padding_saved = original_padding - remainder_padding
+                        if padding_saved > threshold:
+                            custom_split_sizes = [main_reqs, parallel_reqs]
+                        else:
+                            # Not worth splitting; let the batch pad normally.
+                            _should_split = False
+                else:
+                    # main_reqs == 0: num_reqs is smaller than all captured
+                    # graph sizes; fall through to split_batch_split's own logic.
+                    pass
+            if _should_split:
+                split_batch_slices, _ = split_batch_split(
+                    num_scheduled_tokens,
+                    num_tokens_unpadded,
+                    num_tokens_padded,
+                    vllm_config=self.vllm_config,
+                    cudagraph_capture_sizes=cudagraph_capture_sizes,
+                    custom_split_sizes=custom_split_sizes,
+                )
+                if split_batch_slices:
+                    split_ubatch_slices = [
+                        UBatchSlice(s.request_slice, s.token_slice)
+                        for s in split_batch_slices
+                    ]
 
 
         # TODO: Now that num_input_tokens is basically identical with maybe_padded_num_tokens
@@ -1509,12 +1674,18 @@ class NPUModelRunner(GPUModelRunner):
                                              inputs_embeds):
         assert self.model is not None
         forward_context = get_forward_context()
-        hidden_states = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **self._init_model_kwargs(maybe_padded_num_tokens))
+        torch.npu.set_stream_limit(self.stream_main, cube_num=20, vector_num=20)
+        self._t_replay_start = time.perf_counter()
+        with torch.npu.stream(self.stream_main):
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **self._init_model_kwargs(maybe_padded_num_tokens))
+        # Synchronize so that the wall-clock time captured by the caller
+        # reflects actual NPU completion rather than just kernel dispatch.
+        self.stream_main.synchronize()
 
         if (forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
                 and not self.use_sparse
@@ -1573,21 +1744,25 @@ class NPUModelRunner(GPUModelRunner):
             if self.pcp_size * self.dcp_size > 1:
                 update_mla_attn_dcp_pcp_params(update_stream,
                                                forward_context,
-                                               num_tokens)
+                                               num_tokens,
+                                               in_parallel_streams=parallel_streams)
             else:
                 update_mla_attn_params(update_stream, forward_context,
                                        num_tokens,
-                                       self.speculative_config)
+                                       self.speculative_config,
+                                       in_parallel_streams=parallel_streams)
         else:
             if self.pcp_size * self.dcp_size > 1:
                 update_attn_dcp_pcp_params(update_stream,
                                            forward_context,
-                                           num_tokens)
+                                           num_tokens,
+                                           in_parallel_streams=parallel_streams)
             else:
                 update_attn_params_split(update_stream,
                                          forward_context,
                                          num_tokens,
-                                         self.vllm_config)
+                                         self.vllm_config,
+                                         in_parallel_streams=parallel_streams)
     def _slice_split_batch_inputs(self, tokens_slice: slice, input_ids,
                                   positions, inputs_embeds,
                                   intermediate_tensors):
@@ -1642,15 +1817,16 @@ class NPUModelRunner(GPUModelRunner):
 
             ubatch_num_tokens = split_slice.num_tokens
             ubatch_num_reqs = split_slice.num_requests
-            ubatch_batch_descriptor = BatchDescriptor(
+            # Use dispatcher to get the correct BatchDescriptor that matches
+            # what was captured at graph capture time. This ensures the key
+            # used at runtime matches the key stored in concrete_aclgraph_entries
+            # (or concrete_aclgraph_entries2 for parallel streams).
+            # uniform_decode=True because split batch only runs on uniform decode.
+            _, ubatch_batch_descriptor = self.cudagraph_dispatcher.dispatch(
                 num_tokens=split_slice.padded_num_tokens,
-                num_reqs=ubatch_num_reqs,
-                uniform=batch_descriptor.uniform,
+                uniform_decode=batch_descriptor.uniform,
                 has_lora=batch_descriptor.has_lora,
             )
-            ubatch_batch_descriptor = (
-                ubatch_batch_descriptor
-                .relax_for_mixed_batch_cudagraphs())
             # For non-first splits, execute create_ascend_forward_context on
             # stream_parallel so that the GPU ops inside it (update_cos_sin,
             # clone) overlap with the stream_main work for split-0, eliminating
@@ -1748,10 +1924,10 @@ class NPUModelRunner(GPUModelRunner):
 
             ubatch_num_tokens = split_slice.num_tokens
             ubatch_num_reqs = split_slice.num_requests
-            ubatch_batch_descriptor = BatchDescriptor(
+            # Use dispatcher to get the correct BatchDescriptor matching capture time.
+            _, ubatch_batch_descriptor = self.cudagraph_dispatcher.dispatch(
                 num_tokens=split_slice.padded_num_tokens,
-                num_reqs=ubatch_num_reqs,
-                uniform=batch_descriptor.uniform,
+                uniform_decode=batch_descriptor.uniform,
                 has_lora=batch_descriptor.has_lora,
             )
             forward_contexts.append(
@@ -1793,7 +1969,30 @@ class NPUModelRunner(GPUModelRunner):
                 [it.tensors[key] for it in intermediate_tensor_list], dim=0)
         return IntermediateTensors(result)
 
+    def _trim_split_output(self, output: Any, num_tokens: int) -> Any:
+        """Trim a padded split output to its actual token count.
+
+        When padding is applied to align each split to a cudagraph capture size,
+        the model output has shape [padded_N, ...].  This helper slices off the
+        padding rows so that _merge_split_outputs concatenates only real tokens.
+        """
+        if isinstance(output, torch.Tensor):
+            return output[:num_tokens]
+        if isinstance(output, tuple):
+            return tuple(
+                t[:num_tokens] if isinstance(t, torch.Tensor) else t
+                for t in output
+            )
+        if isinstance(output, IntermediateTensors):
+            return IntermediateTensors(
+                {k: v[:num_tokens] for k, v in output.tensors.items()}
+            )
+        # Fallback: return as-is (e.g. None or unknown type)
+        return output
+
     def _merge_split_outputs(self, outputs: list[Any]) -> Any:
+        if not outputs:
+            return None
         first = outputs[0]
         if isinstance(first, IntermediateTensors):
             return self._merge_intermediate_tensors(outputs)
@@ -2083,7 +2282,8 @@ class NPUModelRunner(GPUModelRunner):
                                 },
                             )
 
-                    results.append(result)
+                    results.append(self._trim_split_output(
+                        result, split_batch_slices[slice_idx].num_tokens))
 
                 with override_forward_context(original_forward_context):
                     result = self._merge_split_outputs(results)
@@ -2181,31 +2381,27 @@ class NPUModelRunner(GPUModelRunner):
         results: list[Any] = []
         original_forward_context = get_forward_context()
         torch.npu.set_stream_limit(self.stream_main, cube_num=15, vector_num=20)
-        torch.npu.set_stream_limit(self.stream_parallel, cube_num=5, vector_num=20)
+        torch.npu.set_stream_limit(self.stream_parallel, cube_num=15, vector_num=20)
+        num_splits = len(split_batch_slices)
+        results: list[Optional[Any]] = [None] * num_splits
+        split_errors: list[tuple[int, Exception]] = []
+        split_error_lock = threading.Lock()
 
-        try:
-            num_splits = len(split_batch_slices)
-            results: list[Optional[Any]] = [None] * num_splits
-            split_errors: list[tuple[int, Exception]] = []
-            split_error_lock = threading.Lock()
-
-            def _run_split_replay_worker(slice_idx: int) -> None:
+        self._t_replay_start = time.perf_counter()
+        def _run_split_replay_worker(slice_idx: int) -> None:
+            try:
                 split_slice = split_batch_slices[slice_idx]
                 metadata = ubatch_metadata[slice_idx]
                 current_num_tokens = split_slice.num_tokens
+                # attn_params are keyed by the padded graph size, not the
+                # actual token count.  Use padded_num_tokens as runtime_shape.
+                current_padded_num_tokens = split_slice.padded_num_tokens
                 parallel_streams = slice_idx > 0
                 target_stream = self.stream_parallel if parallel_streams else self.stream_main
-
                 with torch.inference_mode():
-
                     # if parallel_streams:
                     #     split_attn_metadata = attn_metadata
                     #     if isinstance(attn_metadata, list):
-                    #         if slice_idx >= len(attn_metadata):
-                    #             raise RuntimeError(
-                    #                 "parallel attn_metadata list too short: "
-                    #                 f"slice_idx={slice_idx}, len={len(attn_metadata)}"
-                    #             )
                     #         split_attn_metadata = attn_metadata[slice_idx]
 
                     #     split_slot_mapping = _get_slot_mapping_from_attn_metadata(
@@ -2215,7 +2411,7 @@ class NPUModelRunner(GPUModelRunner):
                     #                         int(split_slot_mapping.shape[0]))
                     #         relocated_slot_mapping = split_slot_mapping[:copy_len]
                     #         updated_count = _set_slot_mapping_for_attn_metadata(
-                    #             split_attn_metadata, relocated_slot_mapping)
+                    #             split_attn_metadata, relocated_slost_mapping)
 
                     #     ubatch_batch_descriptor = BatchDescriptor(
                     #         num_tokens=current_num_tokens,
@@ -2268,12 +2464,14 @@ class NPUModelRunner(GPUModelRunner):
                             if aclgraph_runtime_mode == CUDAGraphMode.FULL:
                                 self._update_attn_params_for_split_ubatch(
                                     metadata.context,
-                                    current_num_tokens,
+                                    current_padded_num_tokens,
                                     parallel_streams=parallel_streams)
-                            results[slice_idx] = split_result
-        except Exception as e:
-            with split_error_lock:
-                split_errors.append((slice_idx, e))
+                            results[slice_idx] = self._trim_split_output(
+                                split_result,
+                                split_batch_slices[slice_idx].num_tokens)
+            except Exception as e:
+                with split_error_lock:
+                    split_errors.append((slice_idx, e))
 
         split_workers: list[threading.Thread] = []
         for slice_idx in range(num_splits):
@@ -2295,14 +2493,20 @@ class NPUModelRunner(GPUModelRunner):
 
         # Wait per stream instead of using a device-wide barrier to preserve
         # overlap between split-0(main) and split-1(parallel) replay.
+        logger.debug("[split_batch] synchronizing stream_main")
         self.stream_main.synchronize()
+        logger.debug("[split_batch] stream_main synchronized")
         if len(split_batch_slices) > 1:
+            logger.debug("[split_batch] synchronizing stream_parallel")
             self.stream_parallel.synchronize()
+            logger.debug("[split_batch] stream_parallel synchronized")
         merged_results: list[Any] = [result for result in results
                                         if result is not None]
 
+        logger.debug("[split_batch] merging %d split outputs", len(merged_results))
         with override_forward_context(original_forward_context):
             result = self._merge_split_outputs(merged_results)
+        logger.debug("[split_batch] merge done, returning result")
 
         if not getattr(self, "_split_batch_dumped", False):
             dump_path = os.path.join(
@@ -2473,7 +2677,9 @@ class NPUModelRunner(GPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
-
+        # Record the header-overhead start time: everything from execute_model
+        # entry up to this point (prepare_inputs, metadata, etc.) is "header".
+        self._t_header_start = time.perf_counter()
         with ProfileExecuteDuration().capture_async("prepare input"):
             self._update_states(scheduler_output)
             if has_ec_transfer() and get_ec_transfer().is_producer:
@@ -2572,6 +2778,7 @@ class NPUModelRunner(GPUModelRunner):
 
                 if split_ubatch_slices is not None:
                     if split_enable_parallel_streams:
+                        #logger.info("Running split batch with parallel streams, split_cfg=%s", split_cfg)
                         hidden_states = self._run_split_batch_parallel(
                             split_ubatch_slices,
                             split_batch_slices,
@@ -2583,7 +2790,10 @@ class NPUModelRunner(GPUModelRunner):
                             model_kwargs,
                             batch_descriptor,
                             aclgraph_runtime_mode)
+                        self._t_replay_end = time.perf_counter()
                     else:
+                        #logger.info("Running split batch without parallel streams, split_cfg=%s", split_cfg)
+                        self._t_replay_start = time.perf_counter()
                         hidden_states = self._run_split_batch_gr0(
                         split_ubatch_slices,
                         split_batch_slices,
@@ -2597,13 +2807,32 @@ class NPUModelRunner(GPUModelRunner):
                         aclgraph_runtime_mode,
                     )
                 else:
+                    #logger.info("Running without split batch")
                     hidden_states = self._generate_process_reqs_hidden_states(
                         maybe_padded_num_tokens, input_ids, positions,
                         intermediate_tensors, inputs_embeds)
-
+                    self._t_replay_end = time.perf_counter()
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = self.get_finished_kv_transfer(
                 scheduler_output)
+
+            # Accumulate perf stats for TPOT / header-overhead tracking.
+            # Only count uniform-decode steps (1 output token per request).
+            if uniform_decode:
+                _header_ms = (self._t_replay_start - self._t_header_start) * 1000.0
+                _replay_ms = (self._t_replay_end - self._t_replay_start) * 1000.0
+                _n_tokens = self.input_batch.num_reqs
+                self._last_step_perf = {
+                    "header_ms": _header_ms,
+                    "replay_ms": _replay_ms,
+                    "batch_size": _n_tokens,
+                    "is_split": split_ubatch_slices is not None,
+                }
+                self._perf_accum["total_header_ms"] += _header_ms
+                self._perf_accum["total_replay_ms"] += _replay_ms
+                self._perf_accum["total_output_tokens"] += _n_tokens
+                self._perf_accum["num_decode_steps"] += 1
+                _write_perf_stats(self._last_step_perf)
 
             aux_hidden_states = None
             if self.drafter and self.drafter.name == SpecDcodeType.EAGLE3:
@@ -2632,7 +2861,7 @@ class NPUModelRunner(GPUModelRunner):
                         self.debugger.stop()
                         self.debugger.step()
                     return hidden_states
-                assert isinstance(hidden_states, IntermediateTensors)
+                assert isinstance(hidden_states, IntermediateTensors)   
                 get_pp_group().send_tensor_dict(
                     hidden_states.tensors, all_gather_group=get_tp_group())
                 logits = None
@@ -3429,7 +3658,16 @@ class NPUModelRunner(GPUModelRunner):
                         hidden_states[dummy_indices])
 
             with set_ascend_forward_context(
-                    attn_metadata,
+                    # When capturing for the parallel stream, clone block_tables
+                    # in every per-layer AscendMetadata so that
+                    # _graph_params_parallel binds a *different* device address
+                    # than _graph_params.  Without this, both graph params point
+                    # to the same block_table storage, and the two concurrent
+                    # _refresh_block_table_in_place calls at runtime both write
+                    # to block_table[:8, :], causing a data race that corrupts
+                    # the KV-cache lookup for split-0.
+                    _clone_attn_metadata_block_tables(attn_metadata)
+                    if in_parallel_streams else attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,
                     num_tokens_across_dp=num_tokens_across_dp,
@@ -4251,6 +4489,20 @@ class NPUModelRunner(GPUModelRunner):
         # NOTE: Since aclgraph_batch_sizes cannot be determined until here,
         # we set the graph params right before initializing the keys.
         set_graph_params(self.cudagraph_batch_sizes)
+        # Parallel stream needs its own GraphParams to avoid races when both
+        # streams call graph_task_update_begin/end concurrently.
+        # If split_batch_config.parallel_capture_sizes is set, use those sizes
+        # for the parallel-stream graph pool; otherwise fall back to the main
+        # capture sizes (legacy behaviour).
+        _split_cfg = getattr(self.ascend_config, "split_batch_config", None)
+        _parallel_sizes = (
+            _split_cfg.parallel_capture_sizes
+            if _split_cfg is not None
+            and _split_cfg.parallel_capture_sizes is not None
+            else self.cudagraph_batch_sizes
+        )
+        self.cudagraph_batch_sizes_parallel = _parallel_sizes
+        set_graph_params_parallel(self.cudagraph_batch_sizes_parallel)
         if self.speculative_config:
             set_mtp_graph_params(self.cudagraph_batch_sizes)
 
@@ -4386,15 +4638,17 @@ class NPUModelRunner(GPUModelRunner):
                     uniform_decode=True,
                     in_parallel_streams=False)
 
-        # Second capture (fixed size = 8)
+        # Second capture (parallel-stream graph pool).
+        # Uses self.cudagraph_batch_sizes_parallel which is set in
+        # initialize_aclgraph_capture() and respects
+        # split_batch_config.parallel_capture_sizes when provided.
         if self.ascend_config.split_batch_config.enable_parallel_streams:
-            #fixed_size = self.compilation_config.cudagraph_capture_fixed_size
-            fixed_size = 8
             with graph_capture(device=self.device):
                 if aclgraph_mode.mixed_mode() != CUDAGraphMode.NONE:
                     aclgraph_runtime_mode = aclgraph_mode.mixed_mode()
                     # make sure we capture the largest batch size first
-                    compilation_cases = list(reversed(self.cudagraph_batch_sizes))
+                    compilation_cases = list(
+                        reversed(self.cudagraph_batch_sizes_parallel))
 
                     try:
                         self._capture_aclgraphs(
@@ -4426,7 +4680,7 @@ class NPUModelRunner(GPUModelRunner):
                     max_num_tokens = self.scheduler_config.max_num_seqs * \
                             self.uniform_decode_query_len
                     decode_cudagraph_batch_sizes = [
-                        x for x in self.cudagraph_batch_sizes if
+                        x for x in self.cudagraph_batch_sizes_parallel if
                         x <= max_num_tokens and x >= self.uniform_decode_query_len
                     ]
                     compilation_cases_decode = list(

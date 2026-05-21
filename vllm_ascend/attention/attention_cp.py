@@ -503,8 +503,10 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
             'actual_seq_lengths':
             attn_metadata.actual_seq_lengths_q[:attn_metadata.num_decodes],
         }
-        graph_params = get_graph_params()
         forward_context: ForwardContext = get_forward_context()
+        in_parallel_streams = bool(
+            getattr(forward_context, "in_parallel_streams", False))
+        graph_params = get_graph_params(in_parallel_streams)
         num_tokens = query.shape[0]
         if forward_context.capturing:
             stream = torch_npu.npu.current_stream()
@@ -519,7 +521,8 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
                 workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                     query, k_nope, value, **common_kwargs)
                 update_graph_params_workspaces(num_tokens,
-                                               weak_ref_tensors(workspace))
+                                               weak_ref_tensors(workspace),
+                                               in_parallel_streams=in_parallel_streams)
             attn_out = torch.empty_like(query)
             attn_lse = torch.empty((num_tokens, num_heads, 1),
                                    dtype=torch.float,

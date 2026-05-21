@@ -325,6 +325,24 @@ class SplitBatchConfig:
         self.min_batch_size_for_split: int = int(
             split_batch_config.get("min_batch_size_for_split", 4))
 
+        # Optional separate capture sizes for the parallel-stream graph pool.
+        # When set, the Second capture in _capture_model will use these sizes
+        # instead of the main cudagraph_capture_sizes.  None means "reuse main
+        # capture sizes" (legacy behaviour).
+        raw_parallel_sizes = split_batch_config.get(
+            "parallel_capture_sizes", None)
+        if raw_parallel_sizes is not None:
+            self.parallel_capture_sizes: list[int] = sorted(
+                int(s) for s in raw_parallel_sizes)
+        else:
+            self.parallel_capture_sizes = None
+
+        # When True, always split as (largest_main_graph_hit + remainder) and
+        # skip the padding-saved threshold check.  Useful for benchmarking the
+        # split path regardless of how much padding would be saved.
+        self.force_split: bool = bool(
+            split_batch_config.get("force_split", False))
+
         if self.num_splits < 2:
             raise ValueError("split_batch_config.num_splits must be >= 2")
         if self.min_batch_size_for_split < 1:

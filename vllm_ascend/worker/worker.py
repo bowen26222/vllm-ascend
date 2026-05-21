@@ -138,7 +138,6 @@ class NPUWorker(WorkerBase):
         if "UnquantizedLinearMethod" in WEIGHT_LOADER_V2_SUPPORTED:
             WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
 
-        self.use_v2_model_runner = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
 
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = NPUPlatform.mem_get_info()[0]
@@ -233,15 +232,7 @@ class NPUWorker(WorkerBase):
         # for more details
         self.device = self._init_device()
         # Init ModelRunner here, so that we have access to self.device.
-        if self.use_v2_model_runner:
-            logger.error(
-                "npu model runner v2 is in developing, it can't work well for now."
-            )
-            from vllm_ascend.worker.v2.model_runner import \
-                NPUModelRunner as NPUModelRunnerV2
-            self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
-        else:
-            self.model_runner = NPUModelRunner(self.vllm_config, self.device)
+        self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -265,22 +256,24 @@ class NPUWorker(WorkerBase):
             f" {free_npu_memory}. This happens when the NPU memory was "
             "not properly cleaned up before initializing the vLLM instance.")
 
-        # Get the peak memory allocation recorded by torch
-        peak_memory = torch_npu.npu.memory_stats()["allocated_bytes.all.peak"]
+        # Use torch peak memory during profile_run as the activation headroom.
+        # non_torch_allocations (NPU driver workspace) are NOT added here because
+        # they are permanent driver-level buffers that do not compete with KV cache:
+        # KV cache is allocated from torch's free memory pool after empty_cache(),
+        # which already excludes the non_torch region.
+        torch_peak = torch_npu.npu.memory_stats()["allocated_bytes.all.peak"]
         # TODO: don`t need impl this func after empty_cache in
         # Worker.determine_num_available_blocks() unified`
         NPUPlatform.empty_cache()
-        torch_allocated_bytes = torch_npu.npu.memory_stats(
+        free_after_empty, _ = NPUPlatform.mem_get_info()
+        # activation_headroom = torch_peak - weights (weights are already loaded,
+        # not competing with KV cache; only activations need headroom)
+        torch_allocated_after = torch_npu.npu.memory_stats(
         )["allocated_bytes.all.current"]
-        total_allocated_bytes = torch_npu.npu.mem_get_info(
-        )[1] - torch_npu.npu.mem_get_info()[0]
-        non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
-        if non_torch_allocations > 0:
-            peak_memory += non_torch_allocations
+        activation_headroom = max(torch_peak - torch_allocated_after, 0)
         available_kv_cache_memory = int(
-            total_npu_memory * self.cache_config.gpu_memory_utilization -
-            peak_memory)
-        available_kv_cache_memory = int(max(available_kv_cache_memory, 0))
+            free_after_empty * self.cache_config.gpu_memory_utilization -
+            activation_headroom)
         logger.info(
             f"Available memory: {available_kv_cache_memory}, total memory: {total_npu_memory}"
         )
